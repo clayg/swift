@@ -61,6 +61,7 @@ class StreamFilter(object):
             print 'UPDATE ATOMS'
             mp4stream._updateAtoms()
             status = '200 OK'
+            # FIXME can I come up with a content-length here?
             headers = [('content-type', content_type)]
             # call start response
             print 'calling start_response(%r, %r)' % (status, headers)
