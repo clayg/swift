@@ -21,6 +21,7 @@ ATOM_TREES = [ 'moov', 'trak', 'edts', 'mdia',
 
 # Parses an Atom Tree
 def parse_atom_tree(mp4, range, start):
+    jump_to_pos = None
     atoms = []
     while mp4.tell() < range:
         atom = parse_atom(mp4, start)
@@ -33,10 +34,14 @@ def parse_atom_tree(mp4, range, start):
                 print 'SHIT going back %s bytes' % bytes_to_consume
                 mp4.seek(atom.offset + atom.size, os.SEEK_SET)
             else:
+                if bytes_to_consume > 4 * 2 ** 20:
+                    jump_to_pos = atom.offset + atom.size
+                    print 'found jump_to_pos: %s' % jump_to_pos 
+                    break
                 print 'consuming %s bytes' % bytes_to_consume
                 print bytes_to_consume == atom.size
                 mp4.read(bytes_to_consume)
-    return atoms
+    return atoms, jump_to_pos
 
 # Parses an Atom
 def parse_atom(mp4, start):
@@ -53,8 +58,13 @@ def parse_atom(mp4, start):
                 size = (os.fstat(mp4.fileno()).st_size - offset)
             else:
                 size = (mp4.len - offset)
+        if offset + start > 4 * 2 ** 20:
+            print 'offset: %s' % offset
+            print 'start: %s' % start
+            raise('FOUND IT!')
         return create_atom(mp4, offset, size, type, is_64, start)
     except EndOfFile:
+        raise
         return None
 
 def create_atom(mp4, offset, size, type, is_64, start):
@@ -119,7 +129,8 @@ class StreamAtomTree(StreamAtom):
     def __init__(self, file, offset, size, type, is_64, start):
         StreamAtom.__init__(self, file, offset, size, type, is_64, start)
         print 'PARSE ATOM TREE'
-        children = parse_atom_tree(file, offset+size, start)
+        children, jump_to_pos = parse_atom_tree(file, offset+size, start)
+        self.jump_to_pos = jump_to_pos
         self._set_children(children)
         self.update_order = []
         self.stream_order = []
