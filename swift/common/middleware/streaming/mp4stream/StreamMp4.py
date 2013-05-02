@@ -19,13 +19,10 @@ class StreamMp4(object):
     # pushToStream - Converts source file for pseudo-streaming
     def pushToStream(self):
         # Parse the MP4 into StreamAtom elements
-        print 'PARSE MP4'
         self._parseMp4()
         # Update StreamAtom elements
-        print 'UPDATE ATOMS'
         self._updateAtoms()
         # Write to Stream
-        print 'WRITE NEW'
         self._writeToStream()
     
     def _parseMp4(self):
@@ -51,43 +48,71 @@ class StreamMp4(object):
         return self.atoms
 
 
-class WriteableIterThing(object):
+class MalformedMP4(Exception):
+    pass
 
+
+class SwiftMp4Buffer(object):
     def __init__(self):
         self.buf = []
-
+    
     def write(self, bytes):
-        print 'adding %s bytes to buffer' % len(bytes)
         self.buf.append(bytes)
-
+    
     def __iter__(self):
         self.queue = iter(list(self.buf))
         self.buf = []
         return self
-
+    
     def next(self):
         return self.queue.next()
-
+    
 
 class SwiftStreamMp4(StreamMp4):
-
     def __init__(self, source_file, source_size, start):
         self.source = None
         self.destination = None
         self.source_file = source_file
         self.source_size = source_size
         self.start = int(start) * 1000
-
+    
     def _parseMp4(self):
-        self.atoms = StreamAtomTree(self.source_file, 0, self.source_size, 
+        self.atoms = StreamAtomTree(self.source_file, 0, self.source_size,
                                     '', False, self.start)
-
-    def _yieldToStream(self):
-        self.destination = WriteableIterThing()
-        for type in ["ftyp", "moov", "mdat"]:
+    
+    def _yieldMetadataToStream(self):
+        self.destination = SwiftMp4Buffer()
+        if self._verifyMetadata():
+            for type in ["ftyp", "moov", "mdat"]:
+                for atom in self.atoms.get_atoms():
+                    if atom.copy and atom.type == type:
+                        atom.pushToStream(self.destination)
+                        for chunk in self.destination:
+                            yield chunk
+        else:
+            # The correct thing to do is to adjust the amount of bytes
+            # to be requested to parse the metadata
+            raise MalformedMP4()
+    
+    def _getByteRangeToRequest(self):
+        if self._verifyMetadata():
             for atom in self.atoms.get_atoms():
-                if atom.copy and atom.type == type:
-                    atom.pushToStream(self.destination)
-                    for chunk in self.destination:
-                        print 'yielding chunk'
-                        yield chunk
+                if atom.type == "mdat":
+                    return atom.stream_offset
+        else:
+            # The correct thing to do is to adjust the amount of bytes
+            # to be requested to parse the metadata
+            raise MalformedMP4()
+    
+    def _verifyMetadata(self):
+        # Verify that correct metadata was parsed
+        atom_type = {'ftyp': False, 'moov': False, 'mdat': False}
+        for type in atom_type:
+            for atom in self.atoms.get_atoms():
+                if atom.type == type:
+                    atom_type[type] = True
+        verified = True
+        for type in atom_type:
+            verified = verified and atom_type[type]
+        return verified
+    

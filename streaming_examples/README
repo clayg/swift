@@ -26,10 +26,13 @@
 
     swift post video -r .r:*
 
- * point browser to video player
+ * currently only working from command line, i.e.
+
+    curl http://<swift-all-in-one-ip>:8080/v1/AUTH_test/video/movie.mp4?start=300 > new.mp4
+
+ * point browser to video player and debug ;)
 
     http://<swift-all-in-one-ip>:8080/v1/AUTH_test/video/flowplayer.html
-
 
 
 
