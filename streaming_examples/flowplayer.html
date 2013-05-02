@@ -1,0 +1,25 @@
+<html>
+<script type="text/javascript" src="http://releases.flowplayer.org/js/flowplayer-3.2.12.min.js"></script>
+<script type="text/javascript" src="http://code.jquery.com/jquery-1.9.1.min.js"></script>
+<script type="text/javascript">
+  $(document).ready(function() {
+    $f("myElement", "http://releases.flowplayer.org/swf/flowplayer-3.2.16.swf", {
+      debug: true,
+      clip: {
+        url: 'movie.mp4',
+        provider: 'swift'
+      },
+      plugins: {
+        swift: {
+            url: "http://releases.flowplayer.org/swf/flowplayer.pseudostreaming-3.2.12.swf"
+        }
+      }
+    });
+  });
+</script>
+<body>
+<a id="myElement" style="display:block;width:425px;height:300px;"></a>
+</body>
+</html>
+
+

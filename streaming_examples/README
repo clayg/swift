@@ -1,0 +1,35 @@
+ * Install a working swift dev environment:
+    e.g.  http://docs.openstack.org/developer/swift/development_saio.html
+
+ * Add streaming to pipeline:
+
+    diff --git a/etc/proxy-server.conf-sample b/etc/proxy-server.conf-sample
+    index 32fff87..0794940 100644
+    --- a/etc/proxy-server.conf-sample
+    +++ b/etc/proxy-server.conf-sample
+    @@ -41,7 +41,11 @@
+     # max_clients = 1024
+     
+     [pipeline:main]
+    -pipeline = catch_errors healthcheck proxy-logging cache slo ratelimit tempauth container-quotas account-quotas proxy-logging proxy-server
+    +# pipeline = catch_errors healthcheck proxy-logging cache slo ratelimit tempauth container-quotas account-quotas proxy-logging proxy-server
+    +pipeline = healthcheck cache streaming tempauth proxy-logging proxy-server
+    +
+    +[filter:streaming]
+    +paste.filter_factory = swift.common.middleware.streaming.streaming:filter_factory
+
+ * upload flowplayer landing page AND movie.mp4 (not included):
+    
+    swift upload video flowplayer.html movie.mp4
+
+ * set public acl on video container
+
+    swift post video -r .r:*
+
+ * point browser to video player
+
+    http://<swift-all-in-one-ip>:8080/v1/AUTH_test/video/flowplayer.html
+
+
+
+
