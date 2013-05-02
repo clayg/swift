@@ -21,27 +21,15 @@ ATOM_TREES = [ 'moov', 'trak', 'edts', 'mdia',
 
 # Parses an Atom Tree
 def parse_atom_tree(mp4, range, start):
-    jump_to_pos = None
     atoms = []
     while mp4.tell() < range:
         atom = parse_atom(mp4, start)
         atoms.append(atom)
-        print atom.offset, atom.size, atom.__class__.__name__
-        if mp4.tell() != atom.offset + atom.size:
-            # we have to fix the screwed up pos from the underlying call...
-            bytes_to_consume = atom.offset + atom.size - mp4.tell()
-            if bytes_to_consume < 0:
-                print 'SHIT going back %s bytes' % bytes_to_consume
-                mp4.seek(atom.offset + atom.size, os.SEEK_SET)
-            else:
-                if bytes_to_consume > 4 * 2 ** 20:
-                    jump_to_pos = atom.offset + atom.size
-                    print 'found jump_to_pos: %s' % jump_to_pos 
-                    break
-                print 'consuming %s bytes' % bytes_to_consume
-                print bytes_to_consume == atom.size
-                mp4.read(bytes_to_consume)
-    return atoms, jump_to_pos
+        if (atom.offset + atom.size) >= range:
+            # Terminate loop instead of prematurely going on
+            break
+        mp4.seek(atom.offset + atom.size, os.SEEK_SET)
+    return atoms
 
 # Parses an Atom
 def parse_atom(mp4, start):
@@ -54,17 +42,16 @@ def parse_atom(mp4, start):
             size = read64(mp4)
             is_64 = True
         elif (size == 0):
+            # Hack to be able to interpret StringIO
             if hasattr(mp4, 'fileno'):
                 size = (os.fstat(mp4.fileno()).st_size - offset)
             else:
-                size = (mp4.len - offset)
-        if offset + start > 4 * 2 ** 20:
-            print 'offset: %s' % offset
-            print 'start: %s' % start
-            raise('FOUND IT!')
+                if type == 'mdat':
+                    raise MalformedMP4()
+                else:
+                    size = (mp4.len - offset)
         return create_atom(mp4, offset, size, type, is_64, start)
     except EndOfFile:
-        raise
         return None
 
 def create_atom(mp4, offset, size, type, is_64, start):
@@ -129,8 +116,7 @@ class StreamAtomTree(StreamAtom):
     def __init__(self, file, offset, size, type, is_64, start):
         StreamAtom.__init__(self, file, offset, size, type, is_64, start)
         print 'PARSE ATOM TREE'
-        children, jump_to_pos = parse_atom_tree(file, offset+size, start)
-        self.jump_to_pos = jump_to_pos
+        children = parse_atom_tree(file, offset+size, start)
         self._set_children(children)
         self.update_order = []
         self.stream_order = []

@@ -1065,11 +1065,9 @@ class mdat(StreamAtom):
         CHUNK_OFFSET -= self.stream_offset
     
     def pushToStream(self, stream):
-        self.file.seek(self.stream_offset, os.SEEK_SET)
         # Write in the Box portion of the mdat
         if self.is_64:
             stream.write(struct.pack(">I4sQ", 0, self.type, self.size))
         else:
             stream.write(struct.pack(">I4s", self.size, self.type))
-        stream.write(self.file.read(self.stream_size))
     
