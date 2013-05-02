@@ -14,7 +14,7 @@ class StreamMp4(object):
         self.source = source
         self.source_file = open(self.source, "rb")
         self.destination = destination
-        self.start = int(start) * 1000
+        self.start = int(float(start) * 1000)
     
     # pushToStream - Converts source file for pseudo-streaming
     def pushToStream(self):
@@ -74,7 +74,7 @@ class SwiftStreamMp4(StreamMp4):
         self.destination = None
         self.source_file = source_file
         self.source_size = source_size
-        self.start = int(start) * 1000
+        self.start = int(float(start) * 1000)
     
     def _parseMp4(self):
         self.atoms = StreamAtomTree(self.source_file, 0, self.source_size,
@@ -98,7 +98,7 @@ class SwiftStreamMp4(StreamMp4):
         if self._verifyMetadata():
             for atom in self.atoms.get_atoms():
                 if atom.type == "mdat":
-                    return atom.stream_offset
+                    return (atom.stream_offset, atom.stream_offset + atom.stream_size-1)
         else:
             # The correct thing to do is to adjust the amount of bytes
             # to be requested to parse the metadata

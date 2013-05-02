@@ -24,11 +24,14 @@ def parse_atom_tree(mp4, range, start):
     atoms = []
     while mp4.tell() < range:
         atom = parse_atom(mp4, start)
-        atoms.append(atom)
-        if (atom.offset + atom.size) >= range:
-            # Terminate loop instead of prematurely going on
+        if atom is None:
             break
-        mp4.seek(atom.offset + atom.size, os.SEEK_SET)
+        else:
+            atoms.append(atom)
+            if (atom.offset + atom.size) >= range:
+                # Terminate loop instead of prematurely going on
+                break
+            mp4.seek(atom.offset + atom.size, os.SEEK_SET)
     return atoms
 
 # Parses an Atom
@@ -38,6 +41,7 @@ def parse_atom(mp4, start):
         is_64 = False
         size = read32(mp4)
         type = type_to_str(read32(mp4))
+        print 'PARSING ATOM OF ' + type
         if (size == 1):
             size = read64(mp4)
             is_64 = True
