@@ -1,3 +1,5 @@
+import traceback
+from hashlib import md5
 import urlparse
 from StringIO import StringIO
 
@@ -21,6 +23,8 @@ class StreamFilter(object):
         environ['HTTP_RANGE'] = 'bytes=0-4194304'
         def start_response(status, headers, *args):
             print 'start request start_response(%r, %r)' % (status, headers)
+            if not status.startswith('2'):
+                orig_environ['swift.start_error'] = True
             orig_environ['swift.start_response'] = (status, headers)
 
         return self.app(environ, start_response)
@@ -32,7 +36,7 @@ class StreamFilter(object):
         environ = orig_environ.copy()
         environ['HTTP_RANGE'] = 'bytes=%s-%s' % (start, stop)
         def start_response(status, headers, *args):
-            print 'start request start_response(%r, %r)' % (status, headers)
+            print 'range request start_response(%r, %r)' % (status, headers)
             if not status.startswith('2'):
                 orig_environ['swift.range_error'] = True
             orig_environ['swift.range_response'] = (status, headers)
@@ -54,10 +58,13 @@ class StreamFilter(object):
         # TODO make sure that the type of file requested *is* a mp4
         #      that way we can shortcut this 'expensive' operation
         # TODO make sure that start_param is numeric
-        if start_param:
+        if start_param and environ['REQUEST_METHOD'] == 'GET':
             # the client has specificially included a start param
             start_resp = self.make_start_request(environ)
             start_file = StringIO(''.join(start_resp))
+            if environ.get('swift.start_error'):
+                raise Exception('invalid start response %r' %
+                                environ['swift.start_response'])
             status, headers = environ['swift.start_response']
             for header, value in headers:
                 # 'content-range', 'bytes 0-4194304/72726016'
@@ -67,7 +74,7 @@ class StreamFilter(object):
                     content_type = value
             # parse mp4
             mp4stream = SwiftStreamMp4(start_file, content_length, start_param)
-            print 'PARSE MP4'
+            print 'PARSE MP4 %s' % mp4stream
             mp4stream._parseMp4()
             # ykim's edits are below with comments
             # We have to first verify that the parse successfully obtained
@@ -84,17 +91,27 @@ class StreamFilter(object):
                 print 'calling start_response(%r, %r)' % (status, headers)
                 start_response(status, headers)
                 def body_iter():
-                    print 'Yielding chunks from start request'
-                    # Yield the new metadata
-                    for chunk in mp4stream._yieldMetadataToStream():
-                        yield chunk
-                    start, stop = mp4stream._getByteRangeToRequest()
-                    print 'MAKING RANGE REQUEST: %s-%s' % (start, stop)
-                    range_resp = self.make_range_request(environ, start, stop)
-                    # Start yielding the main data
-                    print 'Yielding chunks from range request'
-                    for chunk in range_resp:
-                        yield chunk
+                    try:
+                        print 'Yielding chunks from start request'
+                        # Yield the new metadata
+                        byte_count = 0
+                        checksum = md5()
+                        for i, chunk in enumerate(mp4stream._yieldMetadataToStream()):
+                            checksum.update(chunk)
+                            yield chunk
+                            byte_count += len(chunk)
+                            if not i % 1000:
+                                print 'le checksum %s' % checksum.hexdigest()
+                                print 'le byte_count %s' % byte_count
+                        start, stop = mp4stream._getByteRangeToRequest()
+                        print 'MAKING RANGE REQUEST: %s-%s' % (start, stop)
+                        range_resp = self.make_range_request(environ, start, stop)
+                        # Start yielding the main data
+                        print 'Yielding chunks from range request'
+                        for chunk in range_resp:
+                            yield chunk
+                    except Exception, e:
+                        print 'Unhandled Exception:\n%s' % traceback.print_exc()
                 return body_iter()
             else:
                 # This should return some error or something

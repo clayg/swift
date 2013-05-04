@@ -59,6 +59,7 @@ def parse_atom(mp4, start):
         return None
 
 def create_atom(mp4, offset, size, type, is_64, start):
+    print 'TYPE', type
     try:
         return eval("%s(mp4, offset, size, type, is_64, start)" % type)
     except NameError:
