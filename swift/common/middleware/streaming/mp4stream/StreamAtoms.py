@@ -100,11 +100,11 @@ class StreamAtom(object):
         return self.children
     
     # Prepare StreamAtom to be pushed into a stream
-    def update(self):
+    def update(self, data={}):
         raise NotImplementedError()
     
     # Returns amount of bytes copied into file
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         raise NotImplementedError()
     
 
@@ -126,18 +126,18 @@ class StreamAtomTree(StreamAtom):
         self.update_order = []
         self.stream_order = []
     
-    def update(self):
+    def update(self, data={}):
         if self.copy:
             # Force each atom that is copyable to update itself
             if self.update_order:
                 for type in self.update_order:
                     for atom in self.get_atoms():
                         if atom.copy and atom.type == type:
-                            atom.update()
+                            atom.update(data)
             else:
                 for atom in self.get_atoms():
                     if atom.copy:
-                        atom.update()
+                        atom.update(data)
             atom_size = 0
             for atom in self.get_atoms():
                 if atom.copy:
@@ -150,7 +150,7 @@ class StreamAtomTree(StreamAtom):
                 self.size = atom_size + 8
                 self.is_64 = False
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         if self.copy:
             if self.is_64:
                 stream.write(struct.pack(">I4sQ", 1, self.type, self.size))
@@ -160,11 +160,11 @@ class StreamAtomTree(StreamAtom):
                 for type in self.stream_order:
                     for atom in self.get_atoms():
                         if atom.copy and atom.type == type:
-                            atom.pushToStream(stream)
+                            atom.pushToStream(stream, data)
             else:
                 for atom in self.get_atoms():
                     if atom.copy:
-                        atom.pushToStream(stream)
+                        atom.pushToStream(stream, data)
     
 
 # Import specific Mp4Atoms

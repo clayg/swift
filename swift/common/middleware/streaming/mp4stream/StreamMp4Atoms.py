@@ -37,12 +37,6 @@ from Helper import *
 from StreamAtoms import StreamAtom, StreamFullAtom, StreamAtomTree
 from StreamExceptions import *
 
-# Global constants defined below to help in pushing to stream
-MP4_TIMESCALE = 0
-TRAK_ID = -1
-TRAK_DATA = {}
-CHUNK_OFFSET = 0
-
 ## Additional classes to keep track of trak metadata
 class TrakData(object):
     # Define necessary objects in Trak
@@ -53,10 +47,7 @@ class TrakData(object):
     start_chunk = None
     start_sample = None
     start_offset = None
-    
-    def __init__(self, id):
-        self.id = id
-    
+        
     def setTimescale(self, timescale):
         self.timescale = timescale
     
@@ -107,12 +98,10 @@ class ftyp(StreamAtom):
         StreamAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
     
-    def update(self):
-        # Update CHUNK_OFFSET
-        global CHUNK_OFFSET
-        CHUNK_OFFSET += self.size
+    def update(self, data={}):
+        data['CHUNK_OFFSET'] += self.size
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # ftyp is just copied over
         self.file.seek(self.offset, os.SEEK_SET)
         stream.write(self.file.read(self.size))
@@ -126,12 +115,15 @@ class moov(StreamAtomTree):
         self.stream_order = ["cmov", "mvhd", "trak", "tkhd"]
         self.copy = True
     
-    def update(self):
-        super(moov, self).update()
+    def update(self, data={}):
+        # Obtain MP4_TIMESCALE from mvhd for tkhd
+        for atom in self.get_atoms():
+            if atom.type == 'mvhd':
+                data['MP4_TIMESCALE'] = atom.timescale
+        super(moov, self).update(data)
         
         # Update CHUNK_OFFSET
-        global CHUNK_OFFSET
-        CHUNK_OFFSET += self.size
+        data['CHUNK_OFFSET'] += self.size
     
 
 ### cmov
@@ -163,18 +155,17 @@ class mvhd(StreamFullAtom):
             raise StartOutOfRange()
         else:
             # Save timescale to global for use in tkhd update
-            global MP4_TIMESCALE
-            MP4_TIMESCALE = timescale
+            self.timescale = timescale
         self.copy = True
     
-    def update(self):
+    def update(self, data={}):
         # mvhd only needs its duration updated
         duration = self.get_attribute('duration')
         timescale = self.get_attribute('timescale')
         stream_duration = duration - (int(self.start) * timescale / 1000)
         self._set_attr('duration', stream_duration)
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         size = self.size
         self.file.seek(self.offset, os.SEEK_SET)
         # Write in the full box
@@ -201,16 +192,19 @@ class mvhd(StreamFullAtom):
 ### trak
 class trak(StreamAtomTree):
     def __init__(self, file, offset, size, type, is_64, start):
-        # Increase which trak is being used
-        global TRAK_ID, TRAK_DATA
-        TRAK_ID += 1
-        TRAK_DATA[TRAK_ID] = TrakData(TRAK_ID)
-        self.trak_id = TRAK_ID
-        
         StreamAtomTree.__init__(self, file, offset, size, type, is_64, start)
         self.update_order = ["tkhd", "mdia"]
         self.stream_order = ["tkhd", "mdia"]
         self.copy = True
+    
+    def update(self, data={}):
+        data['TRAK_DATA'] = TrakData()
+        super(trak, self).update(data)
+        
+        if 'TRAK_START_OFFSET' not in data:
+            data['TRAK_START_OFFSET'] = data['TRAK_DATA'].getStartOffset()
+        else:
+            data['TRAK_START_OFFSET'] = min(data['TRAK_START_OFFSET'], data['TRAK_DATA'].getStartOffset())
     
 
 ### tkhd
@@ -227,14 +221,13 @@ class tkhd(StreamFullAtom):
             self._set_attr('duration', read32(self.file))
         self.copy = True
     
-    def update(self):
+    def update(self, data={}):
         # tkhd only needs its duration updated
-        global MP4_TIMESCALE
         duration = self.get_attribute('duration')
-        stream_duration = duration - (int(self.start) * MP4_TIMESCALE / 1000)
+        stream_duration = duration - (int(self.start) * data['MP4_TIMESCALE'] / 1000)
         self._set_attr('duration', stream_duration)
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         size = self.size
         self.file.seek(self.offset, os.SEEK_SET)
         # Write in the full box
@@ -282,22 +275,19 @@ class mdhd(StreamFullAtom):
             self.file.seek(8, os.SEEK_CUR)
             self._set_attr('timescale', read32(self.file))
             self._set_attr('duration', read32(self.file))
-        
-        # Set trak metadata
-        global TRAK_ID, TRAK_DATA
-        self.trak_id = TRAK_ID
-        # Set timescale to be used by stts
-        trak = TRAK_DATA[self.trak_id]
-        trak.setTimescale(self.get_attribute('timescale'))
     
-    def update(self):
+    def update(self, data={}):
+        # Set trak metadata
+        trak = data['TRAK_DATA']
+        trak.setTimescale(self.get_attribute('timescale'))
+        
         # mdhd only needs its duration updated
         duration = self.get_attribute('duration')
         timescale = self.get_attribute('timescale')
         stream_duration = duration - (int(self.start) * timescale / 1000)
         self._set_attr('duration', stream_duration)
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         size = self.size
         self.file.seek(self.offset, os.SEEK_SET)
         # Write in the full box
@@ -327,11 +317,11 @@ class hdlr(StreamAtom):
         StreamAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
     
-    def update(self):
+    def update(self, data={}):
         # No modifications needed for hdlr
         return
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # hdlr is just copied over
         self.file.seek(self.offset, os.SEEK_SET)
         stream.write(self.file.read(self.size))
@@ -352,11 +342,11 @@ class vmhd(StreamAtom):
         StreamAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
     
-    def update(self):
+    def update(self, data={}):
         # No modifications needed for vmhd
         return
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # vmhd is just copied over
         self.file.seek(self.offset, os.SEEK_SET)
         stream.write(self.file.read(self.size))
@@ -368,11 +358,11 @@ class smhd(StreamAtom):
         StreamAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
     
-    def update(self):
+    def update(self, data={}):
         # No modifications needed for smhd
         return
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # smhd is just copied over
         self.file.seek(self.offset, os.SEEK_SET)
         stream.write(self.file.read(self.size))
@@ -384,11 +374,11 @@ class dinf(StreamAtomTree):
         StreamAtomTree.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
     
-    def update(self):
+    def update(self, data={}):
         # No modifications needed for dinf
         return
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # vmhd is just copied over
         self.file.seek(self.offset, os.SEEK_SET)
         stream.write(self.file.read(self.size))
@@ -402,6 +392,13 @@ class stbl(StreamAtomTree):
         self.stream_order = ["stsd", "stts", "stss", "ctts", "stsc", "stsz", "stco", "co64"]
         self.copy = True
     
+    def update(self, data={}):
+        trak = data['TRAK_DATA']
+        for atom in self.get_atoms():
+            if (atom.type == 'stco') or (atom.type == 'co64'):
+                trak.setChunks(atom.get_attribute('chunk_count'))
+        super(stbl, self).update(data)
+    
 
 ### stsd
 class stsd(StreamAtom):
@@ -409,11 +406,11 @@ class stsd(StreamAtom):
         StreamAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
     
-    def update(self):
+    def update(self, data={}):
         # No modifications needed for stsd
         return
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # stsd is just copied over
         self.file.seek(self.offset, os.SEEK_SET)
         stream.write(self.file.read(self.size))
@@ -425,10 +422,7 @@ class stts(StreamFullAtom):
         StreamFullAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
         
-        # Set trak metadata
-        global TRAK_ID
-        self.trak_id = TRAK_ID
-        # Set stts metadat
+        # Set stts metadata
         self._set_attr('entry_count', read32(self.file))
         entries = []
         while self.file.tell() < (offset+size):
@@ -444,10 +438,9 @@ class stts(StreamFullAtom):
         else:
             self._set_attr('entries', entries)
     
-    def update(self):
+    def update(self, data={}):
         # Derive stream_time from trak data
-        global TRAK_DATA
-        trak = TRAK_DATA[self.trak_id]
+        trak = data['TRAK_DATA']
         trak_timescale = trak.getTimescale()
         start_sample = 0
         stream_time = int(self.start) * trak_timescale / 1000
@@ -484,7 +477,7 @@ class stts(StreamFullAtom):
         else:
             raise MalformedMP4()
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # Simply copy over the initial entries in stts
         self.file.seek(self.offset, os.SEEK_SET)
         
@@ -513,9 +506,6 @@ class stss(StreamFullAtom):
         StreamFullAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
         
-        # Set trak metadata
-        global TRAK_ID
-        self.trak_id = TRAK_ID
         # Set stss metadata
         self._set_attr('entry_count', read32(self.file))
         entries = []
@@ -529,10 +519,9 @@ class stss(StreamFullAtom):
         else:
             self._set_attr('entries', entries)
     
-    def update(self):
+    def update(self, data={}):
         # Obtain start_sample from trak data
-        global TRAK_DATA
-        trak = TRAK_DATA[self.trak_id]
+        trak = data['TRAK_DATA']
         start_sample = trak.getStartSample()
         
         if start_sample:
@@ -566,7 +555,7 @@ class stss(StreamFullAtom):
             # Signal that MP4 is being parsed incorrectly
             raise IncorrectParseMP4()
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # Simply copy over the initial entries in stss
         self.file.seek(self.offset, os.SEEK_SET)
         
@@ -594,9 +583,6 @@ class ctts(StreamFullAtom):
         StreamFullAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
         
-        # Set trak metadata
-        global TRAK_ID
-        self.trak_id = TRAK_ID
         # Set ctts metadat
         self._set_attr('entry_count', read32(self.file))
         entries = []
@@ -613,10 +599,9 @@ class ctts(StreamFullAtom):
         else:
             self._set_attr('entries', entries)
     
-    def update(self):
+    def update(self, data={}):
         # Obtain start_sample from trak data
-        global TRAK_DATA
-        trak = TRAK_DATA[self.trak_id]
+        trak = data['TRAK_DATA']
         start_sample = trak.getStartSample()
         if start_sample:
             start_sample += 1
@@ -649,7 +634,7 @@ class ctts(StreamFullAtom):
         else:
             self.copy = False
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         if self.copy:
             # Simply copy over the initial entries in stts
             print 'new offset', self.offset
@@ -680,9 +665,6 @@ class stsc(StreamFullAtom):
         StreamFullAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
         
-        # Set trak metadata
-        global TRAK_ID
-        self.trak_id = TRAK_ID
         # Set stsc metadat
         self._set_attr('entry_count', read32(self.file))
         
@@ -707,10 +689,9 @@ class stsc(StreamFullAtom):
         else:
             self._set_attr('entries', entries)
     
-    def update(self):
+    def update(self, data={}):
         # Obtain chunk data
-        global TRAK_DATA
-        trak = TRAK_DATA[self.trak_id]
+        trak = data['TRAK_DATA']
         start_sample = trak.getStartSample()
         
         # Parse entries to determine what to modify
@@ -781,7 +762,7 @@ class stsc(StreamFullAtom):
         trak.setStartChunk(start_chunk)
         trak.setChunkSamples(chunk_samples)
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # Simply copy over the initial entries in stts
         self.file.seek(self.offset, os.SEEK_SET)
         
@@ -810,10 +791,6 @@ class stsz(StreamFullAtom):
         StreamFullAtom.__init__(self, file, offset, size, type, is_64, start)
         self.copy = True
         
-        # Set trak metadata
-        global TRAK_ID
-        self.trak_id = TRAK_ID
-        
         # Set stsz metadata
         self._set_attr('uniform_size', read32(self.file))
         self._set_attr('entry_count', read32(self.file))
@@ -832,12 +809,11 @@ class stsz(StreamFullAtom):
             else:
                 self._set_attr('entries', entries)
     
-    def update(self):
+    def update(self, data={}):
         # stsz only needs to be updated if it is not uniform
         if not self.uniform:
             # Obtain start_sample from trak data
-            global TRAK_DATA
-            trak = TRAK_DATA[self.trak_id]
+            trak = data['TRAK_DATA']
             start_sample = trak.getStartSample()
             chunk_samples = trak.getChunkSamples()
             
@@ -862,7 +838,7 @@ class stsz(StreamFullAtom):
             self._set_attr('entry_count', len(entries))
             self._set_attr('entries', entries)
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         self.file.seek(self.offset, os.SEEK_SET)
         
         if self.uniform:
@@ -905,17 +881,9 @@ class stco(StreamFullAtom):
             raise MalformedMP4()
         else:
             self._set_attr('entries', entries)
-            
-        # Set trak metadata
-        global TRAK_ID, TRAK_DATA
-        self.trak_id = TRAK_ID
-        # Set chunks to be used by stsc
-        trak = TRAK_DATA[self.trak_id]
-        trak.setChunks(self.get_attribute('chunk_count'))
     
-    def update(self):
-        global TRAK_DATA
-        trak = TRAK_DATA[self.trak_id]
+    def update(self, data={}):
+        trak = data['TRAK_DATA']
         start_chunk = trak.getStartChunk()
         chunks = trak.getChunks()
         entries = self.get_attribute('entries')
@@ -936,7 +904,7 @@ class stco(StreamFullAtom):
         self._set_attr('chunk_count', len(entries))
         self._set_attr('entries', entries)        
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # Simply copy over the initial entries in stco
         self.file.seek(self.offset, os.SEEK_SET)
         
@@ -952,11 +920,10 @@ class stco(StreamFullAtom):
         stream.write(self.file.read(4))
         
         # Write in stco
-        global CHUNK_OFFSET
         entries = self.get_attribute('entries')
         stream.write(struct.pack(">I", len(entries)))
         for entry in entries:
-            stream.write(struct.pack(">I", entry+CHUNK_OFFSET))
+            stream.write(struct.pack(">I", entry+data['CHUNK_OFFSET']))
     
 
 ### co64
@@ -977,17 +944,9 @@ class co64(StreamFullAtom):
             raise MalformedMP4()
         else:
             self._set_attr('entries', entries)
-            
-        # Set trak metadata
-        global TRAK_ID, TRAK_DATA
-        self.trak_id = TRAK_ID
-        # Set timescale to be used by stsc
-        trak = TRAK_DATA[self.trak_id]
-        trak.setChunks(self.get_attribute('chunk_count'))        
     
-    def update(self):
-        global TRAK_DATA
-        trak = TRAK_DATA[self.trak_id]
+    def update(self, data={}):
+        trak = data['TRAK_DATA']
         start_chunk = trak.getStartChunk()
         chunks = trak.getChunks()
         entries = self.get_attribute('entries')
@@ -1008,7 +967,7 @@ class co64(StreamFullAtom):
         self._set_attr('chunk_count', len(entries))
         self._set_attr('entries', entries)
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # Simply copy over the initial entries in co64
         self.file.seek(self.offset, os.SEEK_SET)
         
@@ -1024,32 +983,21 @@ class co64(StreamFullAtom):
         stream.write(self.file.read(4))
         
         # Write in co64
-        global CHUNK_OFFSET
         entries = self.get_attribute('entries')
         stream.write(struct.pack(">I", len(entries)))
         for entry in entries:
-            stream.write(struct.pack(">Q", entry+CHUNK_OFFSET))
+            stream.write(struct.pack(">Q", entry+data['CHUNK_OFFSET']))
     
 
 ### mdat
 class mdat(StreamAtom):
     def __init__(self, file, offset, size, type, is_64, start):
         StreamAtom.__init__(self, file, offset, size, type, is_64, start)
-        global CHUNK_OFFSET
-        if self.is_64:
-            CHUNK_OFFSET += 16
-        else:
-            CHUNK_OFFSET += 8
         self.file_offset = 0
         self.copy = True
     
-    def update(self):
-        global CHUNK_OFFSET, TRAK_DATA
-        start_offsets = []
-        for key in TRAK_DATA:
-            if TRAK_DATA[key].getStartOffset():
-                start_offsets.append(TRAK_DATA[key].getStartOffset())
-        start_offset = min(start_offsets)
+    def update(self, data={}):
+        start_offset = data['TRAK_START_OFFSET']
         
         # Save file offsets
         self.stream_offset = start_offset
@@ -1059,12 +1007,14 @@ class mdat(StreamAtom):
         self.size = self.stream_size
         if self.is_64:
             self.size += 16
+            data['CHUNK_OFFSET'] += 16
         else:
             self.size += 8
+            data['CHUNK_OFFSET'] += 8
             
-        CHUNK_OFFSET -= self.stream_offset
+        data['CHUNK_OFFSET'] -= self.stream_offset
     
-    def pushToStream(self, stream):
+    def pushToStream(self, stream, data={}):
         # Write in the Box portion of the mdat
         if self.is_64:
             stream.write(struct.pack(">I4sQ", 0, self.type, self.size))

@@ -10,6 +10,8 @@ from StreamAtoms import StreamAtomTree
 
 class StreamMp4(object):
     atoms = None
+    data = None
+    
     def __init__(self, source, destination, start):
         self.source = source
         self.source_file = open(self.source, "rb")
@@ -31,16 +33,17 @@ class StreamMp4(object):
                                     '', False, self.start)
     
     def _updateAtoms(self):
+        self.data = {'CHUNK_OFFSET' : 0}
         for atom in self.atoms.get_atoms():
             if atom.copy:
-                atom.update()
+                atom.update(self.data)
     
     def _writeToStream(self):
-        file = open(self.destination, "w")        
+        file = open(self.destination, "w")
         for type in ["ftyp", "moov", "mdat"]:
             for atom in self.atoms.get_atoms():
                 if atom.copy and atom.type == type:
-                    atom.pushToStream(file)
+                    atom.pushToStream(file, self.data)
         file.close()
     
     # getAtoms - Used primarily for debugging purposes
@@ -86,7 +89,7 @@ class SwiftStreamMp4(StreamMp4):
             for type in ["ftyp", "moov", "mdat"]:
                 for atom in self.atoms.get_atoms():
                     if atom.copy and atom.type == type:
-                        atom.pushToStream(self.destination)
+                        atom.pushToStream(self.destination, self.data)
                         for chunk in self.destination:
                             yield chunk
         else:
