@@ -355,7 +355,7 @@ class TestDiskFile(unittest.TestCase):
         # write some new metadata (fast POST, don't send orig meta, ts 42)
         df = diskfile.DiskFile(self.testdir, 'sda1', '0', 'a', 'c', 'o',
                                     FakeLogger())
-        df.put_metadata({'X-Timestamp': '42', 'X-Object-Meta-Key2': 'Value2'})
+        df.update_metadata({'X-Timestamp': '42', 'X-Object-Meta-Key2': 'Value2'})
         df = diskfile.DiskFile(self.testdir, 'sda1', '0', 'a', 'c', 'o',
                                     FakeLogger())
         with df.open():
@@ -449,7 +449,7 @@ class TestDiskFile(unittest.TestCase):
         tmpdir = os.path.join(self.testdir, 'sda1', 'tmp')
         os.rmdir(tmpdir)
         with diskfile.DiskFile(self.testdir, 'sda1', '0', 'a', 'c',
-                                    'o', FakeLogger()).writer():
+                                    'o', FakeLogger()).create():
             self.assert_(os.path.exists(tmpdir))
 
     def test_iter_hook(self):
@@ -529,7 +529,7 @@ class TestDiskFile(unittest.TestCase):
             timestamp = ts
         else:
             timestamp = str(normalize_timestamp(time()))
-        with df.writer() as writer:
+        with df.create() as writer:
             writer.write(data)
             etag.update(data)
             etag = etag.hexdigest()
@@ -549,14 +549,8 @@ class TestDiskFile(unittest.TestCase):
             if invalid_type == 'Content-Length':
                 metadata['Content-Length'] = fsize - 1
                 diskfile.write_metadata(writer.fd, metadata)
-            df = writer.disk_file
-
         if mark_deleted:
-            metadata = {
-                'X-Timestamp': timestamp,
-                'deleted': True
-            }
-            df.put_metadata(metadata, tombstone=True)
+            df.delete(timestamp)
         if invalid_type == 'Zero-Byte':
             os.remove(df._data_file)
             fp = open(df._data_file, 'w')
@@ -658,34 +652,36 @@ class TestDiskFile(unittest.TestCase):
                                  mark_deleted=True)
         self.assertRaises(DiskFileNotExist, df.open)
 
-    def test_put_metadata(self):
+    def test_update_metadata(self):
         df = self._get_disk_file()
         ts = time()
         metadata = {'X-Timestamp': ts, 'X-Object-Meta-test': 'data'}
-        df.put_metadata(metadata)
+        df.update_metadata(metadata)
         exp_name = '%s.meta' % str(normalize_timestamp(ts))
         dl = os.listdir(df.datadir)
         self.assertEquals(len(dl), 2)
         self.assertTrue(exp_name in set(dl))
 
-    def test_put_metadata_ts(self):
+    def test_delete(self):
         df = self._get_disk_file()
         ts = time()
-        metadata = {'X-Timestamp': ts, 'X-Object-Meta-test': 'data'}
-        df.put_metadata(metadata, tombstone=True)
-        exp_name = '%s.ts' % str(normalize_timestamp(ts))
+        df.delete(ts)
         dl = os.listdir(df.datadir)
-        self.assertEquals(len(dl), 2)
-        self.assertTrue(exp_name in set(dl))
+        self.assertEquals(len(dl), 1)
+        exp_name = '%s.ts' % str(normalize_timestamp(ts))
+        self.assertEquals(exp_name, dl[0])
 
-    def test_unlinkold(self):
-        df1 = self._get_disk_file()
-        future_time = str(normalize_timestamp(time() + 100))
-        self._get_disk_file(ts=future_time)
-        self.assertEquals(len(os.listdir(df1.datadir)), 2)
-        df1.unlinkold(future_time)
-        self.assertEquals(len(os.listdir(df1.datadir)), 1)
-        self.assertEquals(os.listdir(df1.datadir)[0], "%s.data" % future_time)
+    def test_unlinkold_after_create(self):
+        current_time = time()
+        df1 = self._get_disk_file(ts=current_time)
+        dl = os.listdir(df1.datadir)
+        self.assertEquals(len(dl), 1)
+        self.assertEquals(dl[0], "%s.data" % normalize_timestamp(current_time))
+        future_time = current_time + 100
+        df2 = self._get_disk_file(ts=future_time)
+        dl = os.listdir(df2.datadir)
+        self.assertEquals(len(dl), 1)
+        self.assertEquals(dl[0], "%s.data" % normalize_timestamp(future_time))
 
     def test_close_error(self):
 

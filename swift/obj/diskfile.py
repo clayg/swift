@@ -38,8 +38,8 @@ from swift.common.utils import mkdirs, normalize_timestamp, \
     fdatasync, drop_buffer_cache, ThreadPool, lock_path, write_pickle
 from swift.common.exceptions import DiskFileError, DiskFileNotExist, \
     DiskFileCollision, DiskFileDeleted, DiskFileExpired, \
-    DiskFileNotOpenError, DiskFileNoSpace, DiskFileDeviceUnavailable, \
-    PathNotDir
+    DiskFileNotOpenError, DiskWriterNotReady, DiskFileNoSpace, \
+    DiskFileDeviceUnavailable, PathNotDir
 from swift.common.swob import multi_range_iterator
 
 
@@ -262,24 +262,74 @@ def get_hashes(partition_dir, recalculate=None, do_listdir=False,
 
 class DiskWriter(object):
     """
-    Encapsulation of the write context for servicing PUT REST API
-    requests. Serves as the context manager object for DiskFile's writer()
-    method.
+    Encapsulation of the write context for servicing PUT REST API requests.
+    Serves as the context manager object for DiskFile's "create" method.
+
+    :param device_path: path to device (e.g. /srv/node/sdb)
+    :param datadir: path to destination hash
+    :param name: name of the object (e.g. /a/c/o)
+    :param size: optional size in bytes to fallocate
+    :param bytes_per_sync: number of bytes between fdatasync calls
+    :param threadpool: thread pool in which to do blocking operations
+
     """
-    def __init__(self, disk_file, fd, tmppath, threadpool):
-        self.disk_file = disk_file
-        self.fd = fd
-        self.tmppath = tmppath
+    def __init__(self, device_path, datadir, name, size=None,
+                 bytes_per_sync=(512 * 1024 * 1024),
+                 threadpool=None):
+        self.tmpdir = join(device_path, 'tmp')
+        self.datadir = datadir
+        self.name = name
+        self.size = size
+        self.fd = None
+        self.tmppath = None
         self.upload_size = 0
         self.last_sync = 0
-        self.threadpool = threadpool
+        self.bytes_per_sync = bytes_per_sync
+        self.threadpool = threadpool or ThreadPool(nthreads=0)
+
+    def __enter__(self):
+        """
+        Open handle to temporary path, creating directory if needed.  If size
+        was specified it will be fallocated here and raise if unavailable.
+
+        :raises: DiskFileNoSpace
+        """
+        if not exists(self.tmpdir):
+            mkdirs(self.tmpdir)
+        self.fd, self.tmppath = mkstemp(dir=self.tmpdir)
+        if self.size is not None and self.size > 0:
+            try:
+                fallocate(self.fd, self.size)
+            except OSError:
+                raise DiskFileNoSpace()
+        self._timestamp = None
+        self._save_old_data = False
+        return self
+
+    def __exit__(self, t, v, tb):
+        try:
+            if self.fd:
+                os.close(self.fd)
+        except OSError:
+            pass
+        try:
+            if self.tmppath:
+                os.unlink(self.tmppath)
+        except OSError:
+            pass
+        if not self._save_old_data:
+            self.unlinkold()
 
     def write(self, chunk):
         """
         Write a chunk of data into the temporary file.
 
         :param chunk: the chunk of data to write as a string object
+
+        :raises: DiskWriterNotReady if called out of context
         """
+        if not self.fd:
+            raise DiskWriterNotReady()
 
         def _write_entire_chunk(chunk):
             while chunk:
@@ -291,12 +341,12 @@ class DiskWriter(object):
 
         # For large files sync every 512MB (by default) written
         diff = self.upload_size - self.last_sync
-        if diff >= self.disk_file.bytes_per_sync:
+        if diff >= self.bytes_per_sync:
             self.threadpool.force_run_in_thread(fdatasync, self.fd)
             drop_buffer_cache(self.fd, self.last_sync, diff)
             self.last_sync = self.upload_size
 
-    def put(self, metadata, extension='.data'):
+    def _put(self, metadata, extension='.data'):
         """
         Finalize writing the file on disk, and renames it from the temp file
         to the real location.  This should be called after the data has been
@@ -304,11 +354,14 @@ class DiskWriter(object):
 
         :param metadata: dictionary of metadata to be written
         :param extension: extension to be used when making the file
+
+        :raises: DiskWriterNotReady if called out of context
         """
-        if not self.tmppath:
-            raise ValueError("tmppath is unusable.")
-        timestamp = normalize_timestamp(metadata['X-Timestamp'])
-        metadata['name'] = self.disk_file.name
+        if not self.fd:
+            raise DiskWriterNotReady()
+
+        self._timestamp = normalize_timestamp(metadata['X-Timestamp'])
+        metadata['name'] = self.name
 
         def finalize_put():
             # Write the metadata before calling fsync() so that both data and
@@ -322,15 +375,46 @@ class DiskWriter(object):
             # we call drop_cache() after fsync() to avoid redundant work
             # (pages all clean).
             drop_buffer_cache(self.fd, 0, self.upload_size)
-            invalidate_hash(dirname(self.disk_file.datadir))
+            invalidate_hash(dirname(self.datadir))
             # After the rename completes, this object will be available for
             # other requests to reference.
-            data_file = join(self.disk_file.datadir, timestamp + extension)
+            data_file = join(self.datadir, self._timestamp + extension)
             renamer(self.tmppath, data_file)
-            self.disk_file._data_file = data_file
+            self._data_file = data_file
 
         self.threadpool.force_run_in_thread(finalize_put)
-        self.disk_file._metadata = metadata
+        self._metadata = metadata
+
+    def put(self, metadata):
+        return self._put(metadata)
+
+    def put_metadata(self, metadata):
+        self._save_old_data = True
+        return self._put(metadata, extension='.meta')
+
+    def put_tombstone(self, req_timestamp):
+        metadata = {'X-Timestamp': req_timestamp}
+        return self._put(metadata, extension='.ts')
+
+    def unlinkold(self):
+        """
+        Remove any older versions of the object file.  Any file that has an
+        older timestamp than timestamp will be deleted.
+
+        :param timestamp: timestamp to compare with each file
+        """
+        if not self._timestamp:
+            return
+
+        def _unlinkold():
+            for fname in os.listdir(self.datadir):
+                if fname < self._timestamp:
+                    try:
+                        os.unlink(join(self.datadir, fname))
+                    except OSError, err:    # pragma: no cover
+                        if err.errno != errno.ENOENT:
+                            raise
+        self.threadpool.run_in_thread(_unlinkold)
 
 
 class DiskFile(object):
@@ -366,7 +450,6 @@ class DiskFile(object):
         self.datadir = join(
             path, device, storage_directory(obj_dir, partition, name_hash))
         self.device_path = join(path, device)
-        self.tmpdir = join(path, device, 'tmp')
         self.logger = logger
         self.fp = None
         self.iter_etag = None
@@ -590,64 +673,30 @@ class DiskFile(object):
                 self.fp = None
 
     @contextmanager
-    def writer(self, size=None):
+    def create(self, size=None):
         """
-        Context manager to write a file. We create a temporary file first, and
+        Context manager to create a file. We create a temporary file first, and
         then return a DiskWriter object to encapsulate the state.
 
         :param size: optional initial size of file to explicitly allocate on
                      disk
         :raises DiskFileNoSpace: if a size is specified and allocation fails
         """
-        if not exists(self.tmpdir):
-            mkdirs(self.tmpdir)
-        fd, tmppath = mkstemp(dir=self.tmpdir)
-        try:
-            if size is not None and size > 0:
-                try:
-                    fallocate(fd, size)
-                except OSError:
-                    raise DiskFileNoSpace()
-            yield DiskWriter(self, fd, tmppath, self.threadpool)
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                os.unlink(tmppath)
-            except OSError:
-                pass
+        with DiskWriter(self.device_path, self.datadir, self.name,
+                        size=size) as writer:
+            yield writer
+        # FIXME(clayg): this is handy for tests, but sorta sneaky
+        self._data_file = getattr(writer, '_data_file', None)
+        self._metadata = getattr(writer, '_metadata', None)
 
-    def put_metadata(self, metadata, tombstone=False):
+    def update_metadata(self, metadata):
         """
-        Short hand for putting metadata to .meta and .ts files.
+        Update metadata associated with an object.
 
         :param metadata: dictionary of metadata to be written
-        :param tombstone: whether or not we are writing a tombstone
         """
-        extension = '.ts' if tombstone else '.meta'
-        with self.writer() as writer:
-            writer.put(metadata, extension=extension)
-
-    def unlinkold(self, timestamp):
-        """
-        Remove any older versions of the object file.  Any file that has an
-        older timestamp than timestamp will be deleted.
-
-        :param timestamp: timestamp to compare with each file
-        """
-        timestamp = normalize_timestamp(timestamp)
-
-        def _unlinkold():
-            for fname in os.listdir(self.datadir):
-                if fname < timestamp:
-                    try:
-                        os.unlink(join(self.datadir, fname))
-                    except OSError, err:    # pragma: no cover
-                        if err.errno != errno.ENOENT:
-                            raise
-        self.threadpool.run_in_thread(_unlinkold)
+        with self.create() as writer:
+            writer.put_metadata(metadata)
 
     def delete(self, req_timestamp):
         """
@@ -655,8 +704,8 @@ class DiskFile(object):
 
         :param req_timestamp: timestamp of the request to delete object
         """
-        self.put_metadata({'X-Timestamp': req_timestamp}, tombstone=True)
-        self.unlinkold(req_timestamp)
+        with self.create() as writer:
+            writer.put_tombstone(req_timestamp)
 
     def _drop_cache(self, fd, offset, length):
         """Method for no-oping buffer cache drop method."""

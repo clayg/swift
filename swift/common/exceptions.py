@@ -65,6 +65,10 @@ class DiskFileNotOpenError(DiskFileError):
     pass
 
 
+class DiskWriterNotReady(DiskFileError):
+    pass
+
+
 class DiskFileNoSpace(DiskFileError):
     pass
 

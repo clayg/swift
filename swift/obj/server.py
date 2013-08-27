@@ -340,7 +340,7 @@ class ObjectController(object):
             if old_delete_at:
                 self.delete_at_update('DELETE', old_delete_at, account,
                                       container, obj, request, device)
-        disk_file.put_metadata(metadata)
+        disk_file.update_metadata(metadata)
         return HTTPAccepted(request=request)
 
     @public
@@ -384,7 +384,7 @@ class ObjectController(object):
         etag = md5()
         elapsed_time = 0
         try:
-            with disk_file.writer(size=fsize) as writer:
+            with disk_file.create(size=fsize) as writer:
                 reader = request.environ['wsgi.input'].read
                 for chunk in iter(lambda: reader(self.network_chunk_size), ''):
                     start_time = time.time()
@@ -422,7 +422,6 @@ class ObjectController(object):
                 writer.put(metadata)
         except DiskFileNoSpace:
             return HTTPInsufficientStorage(drive=device, request=request)
-        disk_file.unlinkold(metadata['X-Timestamp'])
         if old_delete_at != new_delete_at:
             if new_delete_at:
                 self.delete_at_update(
