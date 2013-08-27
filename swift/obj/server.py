@@ -453,7 +453,13 @@ class ObjectController(object):
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
-            reader = disk_file.open()
+            if self.keep_cache_private or (
+                    'X-Auth-Token' not in request.headers and
+                    'X-Storage-Token' not in request.headers):
+                keep_cache_size = None
+            else:
+                keep_cache_size = self.keep_cache_size
+            reader = disk_file.open(keep_cache_size=keep_cache_size)
             metadata = reader.get_metadata()
             file_size = reader.get_obj_size()
         except DiskFileNotExist:
@@ -506,11 +512,6 @@ class ObjectController(object):
         response.etag = metadata['ETag']
         response.last_modified = float(metadata['X-Timestamp'])
         response.content_length = file_size
-        if response.content_length < self.keep_cache_size and \
-                (self.keep_cache_private or
-                 ('X-Auth-Token' not in request.headers and
-                  'X-Storage-Token' not in request.headers)):
-            reader.keep_cache = True
         if 'Content-Encoding' in metadata:
             response.content_encoding = metadata['Content-Encoding']
         response.headers['X-Timestamp'] = metadata['X-Timestamp']

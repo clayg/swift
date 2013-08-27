@@ -726,3 +726,39 @@ class TestDiskFile(unittest.TestCase):
         with mock.patch("os.path.ismount", _mock_ismount):
             self.assertRaises(DiskFileDeviceUnavailable, self._get_disk_file,
                               mount_check=True)
+
+    def test_drop_cache_with_no_keep_cache_size_drops_cache(self):
+        df = self._get_disk_file()
+        called = []
+        def _mock_drop_buffer_cache(*args, **kwargs):
+            called.append(True)
+        with mock.patch("swift.obj.diskfile.drop_buffer_cache",
+                        _mock_drop_buffer_cache):
+            with df.open() as reader:
+                for chunk in reader:
+                    pass
+        self.assertEquals(called, [True])
+
+    def test_drop_cache_with_small_size_drops_cache(self):
+        df = self._get_disk_file()
+        called = []
+        def _mock_drop_buffer_cache(*args, **kwargs):
+            called.append(True)
+        with mock.patch("swift.obj.diskfile.drop_buffer_cache",
+                        _mock_drop_buffer_cache):
+            with df.open(keep_cache_size=1) as reader:
+                for chunk in reader:
+                    pass
+        self.assertEquals(called, [True])
+
+    def test_drop_cache_with_large_size_keeps_cache(self):
+        df = self._get_disk_file()
+        called = []
+        def _mock_drop_buffer_cache(*args, **kwargs):
+            called.append(True)
+        with mock.patch("swift.obj.diskfile.drop_buffer_cache",
+                        _mock_drop_buffer_cache):
+            with df.open(keep_cache_size=2 ** 20) as reader:
+                for chunk in reader:
+                    pass
+        self.assertEquals(called, [])

@@ -424,6 +424,7 @@ class DiskReader(object):
     :param datadir: path to destination hash
     :param name: name of the object (e.g. /a/c/o)
     :param disk_chunk_size: size of chunks on file reads
+    :param keep_cache_size: if set, buffers not dropped for smaller files
     :param iter_hook: called when __iter__ returns a chunk
     :param threadpool: thread pool in which to do blocking operations
 
@@ -434,19 +435,19 @@ class DiskReader(object):
     :raises DiskFileCollision: on md5 collision
     """
     def __init__(self, device_path, datadir, name, logger=None,
-                 disk_chunk_size=65536, iter_hook=None, threadpool=None):
+                 disk_chunk_size=65536, keep_cache_size=None, iter_hook=None,
+                 threadpool=None):
         self.device_path = device_path
         self.datadir = datadir
         self.name = name
         self.logger = logger or \
             logging.getLogger('swift.obj.diskfile.diskreader')
+        self.keep_cache_size = keep_cache_size
+        self._keep_cache = False
         self.disk_chunk_size = disk_chunk_size
         self.iter_hook = iter_hook
         self.threadpool = threadpool or ThreadPool(nthreads=0)
         self.quarantined_dir = None
-
-        # FIXME(clayg): internal state set after open to change behavior
-        self.keep_cache = False
 
         self._iter_etag = None
         self._started_at_0 = False
@@ -571,12 +572,15 @@ class DiskReader(object):
 
     def _drop_cache(self, fd, offset, length):
         """Method for no-oping buffer cache drop method."""
-        if not self.keep_cache:
+        if not self._keep_cache:
             drop_buffer_cache(fd, offset, length)
 
     def __iter__(self):
         """Returns an iterator over the data file."""
-        self.get_obj_size()
+        file_size = self.get_obj_size()
+        if self.keep_cache_size and file_size < self.keep_cache_size:
+            self._keep_cache = True
+
         try:
             dropped_cache = 0
             read = 0
@@ -727,13 +731,14 @@ class DiskFile(object):
         self.threadpool = threadpool or ThreadPool(nthreads=0)
         self._reader = None
 
-    def open(self):
+    def open(self, keep_cache_size=None):
         """
         Read metadata and prepare DiskFile for reading.
         """
         return DiskReader(self.device_path, self.datadir, self.name,
                           logger=self.logger,
                           disk_chunk_size=self.disk_chunk_size,
+                          keep_cache_size=keep_cache_size,
                           iter_hook=self.iter_hook,
                           threadpool=self.threadpool)
 
