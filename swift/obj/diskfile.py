@@ -500,6 +500,8 @@ class DiskFile(object):
         self.close()
 
     def read_metadata(self):
+        if hasattr(self, '_metadata'):
+            return self._metadata
         if self.fp:
             datafile_metadata = read_metadata(self.fp)
         else:
@@ -556,12 +558,6 @@ class DiskFile(object):
         """
         if 'deleted' in metadata:
             raise DiskFileDeleted(metadata['X-Timestamp'])
-
-    @property
-    def metadata(self):
-        if not hasattr(self, '_metadata'):
-            self._metadata = self.read_metadata()
-        return self._metadata
 
     def __iter__(self):
         """Returns an iterator over the data file."""
@@ -647,8 +643,8 @@ class DiskFile(object):
             return
 
         if self.iter_etag and self.started_at_0 and self.read_to_eof and \
-                'ETag' in self.metadata and \
-                self.iter_etag.hexdigest() != self.metadata.get('ETag'):
+                'ETag' in self._metadata and \
+                self.iter_etag.hexdigest() != self._metadata.get('ETag'):
             self.quarantine()
 
     def close(self, verify_file=True):
@@ -744,8 +740,8 @@ class DiskFile(object):
             file_size = 0
             file_size = self.threadpool.run_in_thread(
                 getsize, self._data_file)
-            if 'Content-Length' in self.metadata:
-                metadata_size = int(self.metadata['Content-Length'])
+            if 'Content-Length' in self._metadata:
+                metadata_size = int(self._metadata['Content-Length'])
                 if file_size != metadata_size:
                     raise DiskFileError(
                         'Content-Length of %s does not match file size '
