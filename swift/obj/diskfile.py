@@ -546,6 +546,7 @@ class DiskReader(object):
             if 'Content-Length' in self._metadata:
                 metadata_size = int(self._metadata['Content-Length'])
                 if file_size != metadata_size:
+                    self.quarantine()
                     raise DiskFileSizeInvalid(
                         'Content-Length of %s does not match file size '
                         'of %s' % (metadata_size, file_size))
@@ -664,7 +665,6 @@ class DiskReader(object):
         try:
             self.get_obj_size()
         except DiskFileError:
-            self.quarantine()
             return
         if self._iter_etag and self._started_at_0 and self._read_to_eof and \
                 'ETag' in self._metadata and \

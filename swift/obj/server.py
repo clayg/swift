@@ -315,13 +315,8 @@ class ObjectController(object):
         except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
         try:
-            with disk_file.open() as reader:
-                reader.get_obj_size()
-                orig_metadata = reader.get_metadata()
-        except DiskFileNotExist:
-            return HTTPNotFound(request=request)
+            orig_metadata = disk_file.read_metadata()
         except DiskFileError:
-            reader.quarantine()
             return HTTPNotFound(request=request)
         orig_timestamp = orig_metadata.get('X-Timestamp', '0')
         if orig_timestamp >= request.headers['x-timestamp']:
@@ -467,7 +462,6 @@ class ObjectController(object):
             else:
                 return HTTPNotFound(request=request)
         except DiskFileError:
-            reader.quarantine()
             return HTTPNotFound(request=request)
         if request.headers.get('if-match') not in (None, '*') and \
            metadata['ETag'] not in request.if_match:
@@ -537,10 +531,7 @@ class ObjectController(object):
             with disk_file.open() as reader:
                 file_size = reader.get_obj_size()
                 metadata = reader.get_metadata()
-        except DiskFileNotExist:
-            return HTTPNotFound(request=request)
         except DiskFileError:
-            reader.quarantine()
             return HTTPNotFound(request=request)
         response = Response(request=request, conditional_response=True)
         response.headers['Content-Type'] = metadata.get(

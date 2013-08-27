@@ -24,7 +24,7 @@ from swift.obj import server as object_server
 from swift.common.utils import get_logger, audit_location_generator, \
     ratelimit_sleep, config_true_value, dump_recon_cache, list_from_csv, json
 from swift.common.exceptions import AuditException, DiskFileError, \
-    DiskFileNotExist
+    DiskFileNotExist, DiskFileSizeInvalid
 from swift.common.daemon import Daemon
 
 SLEEP_BETWEEN_AUDITS = 30
@@ -173,6 +173,13 @@ class AuditorWorker(object):
                     reader = df.open()
                     obj_size = reader.get_obj_size()
                 except DiskFileNotExist:
+                    return
+                except DiskFileSizeInvalid as e:
+                    self.logger.increment('quarantines')
+                    self.quarantines += 1
+                    self.logger.error(_('ERROR Object %(obj)s failed audit '
+                                        'and will be quarantined: %(err)s'),
+                                      {'obj': path, 'err': e})
                     return
                 except DiskFileError as e:
                     raise AuditException(str(e))
