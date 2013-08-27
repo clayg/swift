@@ -194,7 +194,6 @@ class AuditorWorker(object):
                         incr_by=len(chunk))
                     self.bytes_processed += len(chunk)
                     self.total_bytes_processed += len(chunk)
-                reader.close()
                 if reader.quarantined_dir:
                     self.quarantines += 1
                     self.logger.error(
@@ -203,7 +202,7 @@ class AuditorWorker(object):
                         {'path': path})
             finally:
                 if reader:
-                    reader.close(verify_file=False)
+                    reader.close()
         except AuditException as err:
             self.logger.increment('quarantines')
             self.quarantines += 1

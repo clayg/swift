@@ -36,9 +36,9 @@ from swift.common.constraints import check_mount
 from swift.common.utils import mkdirs, normalize_timestamp, \
     storage_directory, hash_path, renamer, fallocate, fsync, \
     fdatasync, drop_buffer_cache, ThreadPool, lock_path, write_pickle
-from swift.common.exceptions import DiskFileError, DiskFileSizeInvalid, \
-    DiskFileNotExist, DiskFileCollision, DiskFileDeleted, DiskFileExpired, \
-    DiskWriterNotReady, DiskFileNoSpace, DiskFileDeviceUnavailable, PathNotDir
+from swift.common.exceptions import DiskFileSizeInvalid, DiskFileNotExist, \
+    DiskFileCollision, DiskFileDeleted, DiskFileExpired, DiskWriterNotReady, \
+    DiskFileNoSpace, DiskFileDeviceUnavailable, PathNotDir
 from swift.common.swob import multi_range_iterator
 
 
@@ -446,7 +446,6 @@ class DiskReader(object):
         self.quarantined_dir = None
 
         # FIXME(clayg): internal state set after open to change behavior
-        self.verify_close = True
         self.keep_cache = False
 
         self._iter_etag = None
@@ -577,6 +576,7 @@ class DiskReader(object):
 
     def __iter__(self):
         """Returns an iterator over the data file."""
+        self.get_obj_size()
         try:
             dropped_cache = 0
             read = 0
@@ -662,26 +662,18 @@ class DiskReader(object):
         """Check if file needs to be quarantined"""
         if self.quarantined_dir:
             return
-        try:
-            self.get_obj_size()
-        except DiskFileError:
-            return
         if self._iter_etag and self._started_at_0 and self._read_to_eof and \
                 'ETag' in self._metadata and \
                 self._iter_etag.hexdigest() != self._metadata.get('ETag'):
             self.quarantine()
 
-    def close(self, verify_file=True):
+    def close(self):
         """
         Close the file. Will handle quarantining file if necessary.
-
-        :param verify_file: Defaults to True. If false, will not check
-                            file to see if it needs quarantining.
         """
         if self.fp:
             try:
-                if verify_file:
-                    self._handle_close_quarantine()
+                self._handle_close_quarantine()
             except (Exception, Timeout), e:
                 self.logger.error(_(
                     'ERROR DiskFile %(data_file)s in '
@@ -696,7 +688,7 @@ class DiskReader(object):
         return self
 
     def __exit__(self, t, v, tb):
-        self.close(verify_file=self.verify_close)
+        self.close()
 
 
 class DiskFile(object):
@@ -749,8 +741,6 @@ class DiskFile(object):
         with self.open() as dfr:
             if verify_data_file_size:
                 dfr.get_obj_size()
-            else:
-                dfr.verify_close = False
             return dfr.get_metadata()
 
     @contextmanager

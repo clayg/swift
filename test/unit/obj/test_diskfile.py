@@ -39,7 +39,7 @@ from swift.common import utils
 from swift.common.utils import hash_path, mkdirs, normalize_timestamp
 from swift.common import ring
 from swift.common.exceptions import DiskFileError, DiskFileNotExist, \
-        DiskFileDeleted, DiskFileDeviceUnavailable
+        DiskFileDeleted, DiskFileDeviceUnavailable, DiskFileSizeInvalid
 
 
 def _create_test_ring(path):
@@ -579,36 +579,38 @@ class TestDiskFile(unittest.TestCase):
                 pass
         self.assertFalse(reader.quarantined_dir)
 
+    def _safe_disk_iter(self, disk_iter):
+        try:
+            for chunk in disk_iter:
+                pass
+        except DiskFileError:
+            pass
+
     def run_quarantine_invalids(self, invalid_type):
         df = self._get_disk_file(invalid_type=invalid_type, obj_name='1')
         with df.open() as reader:
-            for chunk in reader:
-                pass
+            self._safe_disk_iter(reader)
         self.assertTrue(reader.quarantined_dir)
         df = self._get_disk_file(invalid_type=invalid_type,
                                  obj_name='2', csize=1)
         with df.open() as reader:
-            for chunk in reader:
-                pass
+            self._safe_disk_iter(reader)
         self.assertTrue(reader.quarantined_dir)
         df = self._get_disk_file(invalid_type=invalid_type,
                                  obj_name='3', csize=100000)
         with df.open() as reader:
-            for chunk in reader:
-                pass
+            self._safe_disk_iter(reader)
         self.assertTrue(reader.quarantined_dir)
         df = self._get_disk_file(invalid_type=invalid_type, obj_name='4')
         with df.open() as reader:
             self.assertFalse(reader.quarantined_dir)
         df = self._get_disk_file(invalid_type=invalid_type, obj_name='5')
         with df.open() as reader:
-            for chunk in reader.app_iter_range(0, df.unit_test_len):
-                pass
+            self._safe_disk_iter(reader.app_iter_range(0, df.unit_test_len))
         self.assertTrue(reader.quarantined_dir)
         df = self._get_disk_file(invalid_type=invalid_type, obj_name='6')
         with df.open() as reader:
-            for chunk in reader.app_iter_range(0, df.unit_test_len + 100):
-                pass
+            self._safe_disk_iter(reader.app_iter_range(0, df.unit_test_len + 100))
         self.assertTrue(reader.quarantined_dir)
         expected_quar = False
         # for the following, Content-Length/Zero-Byte errors will always result
@@ -617,18 +619,15 @@ class TestDiskFile(unittest.TestCase):
             expected_quar = True
         df = self._get_disk_file(invalid_type=invalid_type, obj_name='7')
         with df.open() as reader:
-            for chunk in reader.app_iter_range(1, df.unit_test_len):
-                pass
+            self._safe_disk_iter(reader.app_iter_range(1, df.unit_test_len))
         self.assertEquals(bool(reader.quarantined_dir), expected_quar)
         df = self._get_disk_file(invalid_type=invalid_type, obj_name='8')
         with df.open() as reader:
-            for chunk in reader.app_iter_range(0, df.unit_test_len - 1):
-                pass
+            self._safe_disk_iter(reader.app_iter_range(0, df.unit_test_len - 1))
         self.assertEquals(bool(reader.quarantined_dir), expected_quar)
         df = self._get_disk_file(invalid_type=invalid_type, obj_name='8')
         with df.open() as reader:
-            for chunk in reader.app_iter_range(1, df.unit_test_len + 1):
-                pass
+            self._safe_disk_iter(reader.app_iter_range(1, df.unit_test_len + 1))
         self.assertEquals(bool(reader.quarantined_dir), expected_quar)
 
     def test_quarantine_invalids(self):
@@ -636,18 +635,36 @@ class TestDiskFile(unittest.TestCase):
         self.run_quarantine_invalids('Content-Length')
         self.run_quarantine_invalids('Zero-Byte')
 
-    def test_quarantine_deleted_files(self):
+    def test_quarantine_on_get_size(self):
         df = self._get_disk_file(invalid_type='Content-Length')
         try:
             with df.open() as reader:
-                pass
+                reader.get_obj_size()
         except DiskFileError:
             pass
         self.assertTrue(reader.quarantined_dir)
         self.assertRaises(DiskFileNotExist, df.open)
-        df = self._get_disk_file(invalid_type='Content-Length',
-                                 mark_deleted=True)
+
+    def test_quarantine_on_read(self):
+        df = self._get_disk_file(invalid_type='Content-Length')
+        try:
+            with df.open() as reader:
+                iter(reader).next()
+        except DiskFileError:
+            pass
+        self.assertTrue(reader.quarantined_dir)
         self.assertRaises(DiskFileNotExist, df.open)
+
+    def test_quarantine_on_read_metadata(self):
+        df = self._get_disk_file(invalid_type='Content-Length')
+        self.assertRaises(DiskFileSizeInvalid, df.read_metadata)
+        self.assertRaises(DiskFileNotExist, df.open)
+
+    def test_skip_quarantine_check_on_read_metadata(self):
+        df = self._get_disk_file(invalid_type='Content-Length')
+        df.read_metadata(verify_data_file_size=False)
+        with df.open() as reader:
+            self.assertRaises(DiskFileSizeInvalid, reader.get_obj_size)
 
     def test_update_metadata(self):
         df = self._get_disk_file()
@@ -698,6 +715,7 @@ class TestDiskFile(unittest.TestCase):
         df = self._get_disk_file(invalid_type='Content-Length')
         with df.open() as reader:
             self.assert_(os.path.isfile(reader._data_file))
+            self._safe_disk_iter(reader)
         self.assertFalse(os.path.isfile(reader._data_file))
         self.assert_(os.path.isdir(reader.quarantined_dir))
         self.assertEquals(reader.quarantine(), None)
