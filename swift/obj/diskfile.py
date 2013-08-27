@@ -36,8 +36,8 @@ from swift.common.constraints import check_mount
 from swift.common.utils import mkdirs, normalize_timestamp, \
     storage_directory, hash_path, renamer, fallocate, fsync, \
     fdatasync, drop_buffer_cache, ThreadPool, lock_path, write_pickle
-from swift.common.exceptions import DiskFileError, DiskFileNotExist, \
-    DiskFileCollision, DiskFileDeleted, DiskFileExpired, \
+from swift.common.exceptions import DiskFileError, DiskFileSizeInvalid, \
+    DiskFileNotExist, DiskFileCollision, DiskFileDeleted, DiskFileExpired, \
     DiskWriterNotReady, DiskFileNoSpace, DiskFileDeviceUnavailable, PathNotDir
 from swift.common.swob import multi_range_iterator
 
@@ -546,7 +546,7 @@ class DiskReader(object):
             if 'Content-Length' in self._metadata:
                 metadata_size = int(self._metadata['Content-Length'])
                 if file_size != metadata_size:
-                    raise DiskFileError(
+                    raise DiskFileSizeInvalid(
                         'Content-Length of %s does not match file size '
                         'of %s' % (metadata_size, file_size))
             return file_size
@@ -562,7 +562,7 @@ class DiskReader(object):
         self._data_file does not exist.
 
         :returns: file size as an int
-        :raises DiskFileError: on file size mismatch.
+        :raises DiskFileSizeInvalid: on file size mismatch.
         :raises DiskFileNotExist: on file not existing (including deleted)
         """
         if self._obj_size is None:
