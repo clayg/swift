@@ -38,8 +38,7 @@ from swift.common.utils import mkdirs, normalize_timestamp, \
     fdatasync, drop_buffer_cache, ThreadPool, lock_path, write_pickle
 from swift.common.exceptions import DiskFileError, DiskFileNotExist, \
     DiskFileCollision, DiskFileDeleted, DiskFileExpired, \
-    DiskFileNotOpenError, DiskWriterNotReady, DiskFileNoSpace, \
-    DiskFileDeviceUnavailable, PathNotDir
+    DiskWriterNotReady, DiskFileNoSpace, DiskFileDeviceUnavailable, PathNotDir
 from swift.common.swob import multi_range_iterator
 
 
@@ -417,48 +416,52 @@ class DiskWriter(object):
         self.threadpool.run_in_thread(_unlinkold)
 
 
-class DiskFile(object):
+class DiskReader(object):
     """
-    Manage object files on disk.
+    Read object from storage.
 
-    :param path: path to devices on the node
-    :param device: device name
-    :param partition: partition on the device the object lives in
-    :param account: account name for the object
-    :param container: container name for the object
-    :param obj: object name for the object
-    :param keep_data_fp: if True, don't close the fp, otherwise close it
+    :param device_path: path to device (e.g. /srv/node/sdb)
+    :param datadir: path to destination hash
+    :param name: name of the object (e.g. /a/c/o)
     :param disk_chunk_size: size of chunks on file reads
-    :param bytes_per_sync: number of bytes between fdatasync calls
     :param iter_hook: called when __iter__ returns a chunk
     :param threadpool: thread pool in which to do blocking operations
 
-    """
 
-    def __init__(self, path, device, partition, account, container, obj,
-                 logger, disk_chunk_size=65536,
-                 bytes_per_sync=(512 * 1024 * 1024),
-                 iter_hook=None, threadpool=None, obj_dir='objects',
-                 mount_check=False):
-        if mount_check and not check_mount(path, device):
-            raise DiskFileDeviceUnavailable()
+    :raises DiskFileNotExist: if the data file can't be found
+    :raises DiskFileDeleted: if the object is deleted
+    :raises DiskFileExpired: if the object is expired
+    :raises DiskFileCollision: on md5 collision
+    """
+    def __init__(self, device_path, datadir, name, logger=None,
+                 disk_chunk_size=65536, iter_hook=None, threadpool=None):
+        self.device_path = device_path
+        self.datadir = datadir
+        self.name = name
+        self.logger = logger or \
+            logging.getLogger('swift.obj.diskfile.diskreader')
         self.disk_chunk_size = disk_chunk_size
-        self.bytes_per_sync = bytes_per_sync
         self.iter_hook = iter_hook
-        self.name = '/' + '/'.join((account, container, obj))
-        name_hash = hash_path(account, container, obj)
-        self.datadir = join(
-            path, device, storage_directory(obj_dir, partition, name_hash))
-        self.device_path = join(path, device)
-        self.logger = logger
-        self.fp = None
-        self.iter_etag = None
-        self.started_at_0 = False
-        self.read_to_eof = False
-        self.quarantined_dir = None
-        self.keep_cache = False
-        self.suppress_file_closing = False
         self.threadpool = threadpool or ThreadPool(nthreads=0)
+        self.quarantined_dir = None
+
+        # FIXME(clayg): internal state set after open to change behavior
+        self.verify_close = True
+        self.keep_cache = False
+
+        self._iter_etag = None
+        self._started_at_0 = False
+        self._read_to_eof = False
+        self._suppress_file_closing = False
+
+        self._meta_file = None
+        self._data_file = None
+        self._find_data_file()
+
+        self.fp = open(self._data_file, 'rb')
+        self._metadata = self._read_metadata()
+
+        self._obj_size = None
 
     def _find_data_file(self):
         if not exists(self.datadir):
@@ -471,67 +474,13 @@ class DiskFile(object):
                     metadata = read_metadata(mfp)
                 metadata['deleted'] = True
                 raise DiskFileDeleted(metadata['X-Timestamp'])
-            if afile.endswith('.meta') and not hasattr(self, '_meta_file'):
+            if afile.endswith('.meta') and not self._meta_file:
                 self._meta_file = join(self.datadir, afile)
-            if afile.endswith('.data') and not hasattr(self, '_data_file'):
+            if afile.endswith('.data') and not self._data_file:
                 self._data_file = join(self.datadir, afile)
                 break
-        if not hasattr(self, '_data_file'):
+        if not self._data_file:
             raise DiskFileNotExist()
-
-    def open(self):
-        """
-        Read metadata and prepare DiskFile for reading.
-
-        :raises DiskFileNotExist: if the data file can't be found
-        :raises DiskFileDeleted: if the object is deleted
-        :raises DiskFileExpired: if the object is expired
-        :raises DiskFileCollision: on md5 collision
-        """
-        self._find_data_file()
-        self.fp = open(self._data_file, 'rb')
-        self._metadata = self.read_metadata()
-        return self
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, t, v, tb):
-        self.close()
-
-    def read_metadata(self):
-        if hasattr(self, '_metadata'):
-            return self._metadata
-        if self.fp:
-            datafile_metadata = read_metadata(self.fp)
-        else:
-            if not hasattr(self, '_data_file'):
-                self._find_data_file()
-            with open(self._data_file) as dfp:
-                datafile_metadata = read_metadata(dfp)
-
-        if hasattr(self, '_meta_file'):
-            with open(self._meta_file) as mfp:
-                metadata = read_metadata(mfp)
-            sys_metadata = dict(
-                [(key, val) for key, val in datafile_metadata.iteritems()
-                 if key.lower() in DATAFILE_SYSTEM_META])
-            metadata.update(sys_metadata)
-        else:
-            metadata = datafile_metadata
-
-        self._check_metadata(metadata)
-        return metadata
-
-    def _check_metadata(self, metadata):
-        """
-        :raises DiskFileDeleted: if the object is deleted
-        :raises DiskFileExpired: if the object is expired
-        :raises DiskFileCollision: on md5 collision
-        """
-        self._check_collision(metadata)
-        self._check_deleted(metadata)
-        self._check_expired(metadata)
 
     def _check_collision(self, metadata):
         """
@@ -559,24 +508,88 @@ class DiskFile(object):
         if 'deleted' in metadata:
             raise DiskFileDeleted(metadata['X-Timestamp'])
 
+    def _check_metadata(self, metadata):
+        """
+        :raises DiskFileDeleted: if the object is deleted
+        :raises DiskFileExpired: if the object is expired
+        :raises DiskFileCollision: on md5 collision
+        """
+        self._check_collision(metadata)
+        self._check_deleted(metadata)
+        self._check_expired(metadata)
+
+    def _read_metadata(self):
+        datafile_metadata = read_metadata(self.fp)
+        if self._meta_file:
+            with open(self._meta_file) as mfp:
+                metadata = read_metadata(mfp)
+            sys_metadata = dict(
+                [(key, val) for key, val in datafile_metadata.iteritems()
+                 if key.lower() in DATAFILE_SYSTEM_META])
+            metadata.update(sys_metadata)
+        else:
+            metadata = datafile_metadata
+        self._check_metadata(metadata)
+        return metadata
+
+    def get_metadata(self):
+        """
+        Public accessor for consistency with get_obj_size.
+        """
+        return self._metadata
+
+    def _read_data_file_size(self):
+        try:
+            file_size = 0
+            file_size = self.threadpool.run_in_thread(
+                getsize, self._data_file)
+            if 'Content-Length' in self._metadata:
+                metadata_size = int(self._metadata['Content-Length'])
+                if file_size != metadata_size:
+                    raise DiskFileError(
+                        'Content-Length of %s does not match file size '
+                        'of %s' % (metadata_size, file_size))
+            return file_size
+        except OSError, err:
+            if err.errno != errno.ENOENT:
+                raise
+        raise DiskFileNotExist('Data File does not exist.')
+
+    def get_obj_size(self):
+        """
+        Returns the os.path.getsize for the file.  Raises an exception if this
+        file does not match the Content-Length stored in the metadata. Or if
+        self._data_file does not exist.
+
+        :returns: file size as an int
+        :raises DiskFileError: on file size mismatch.
+        :raises DiskFileNotExist: on file not existing (including deleted)
+        """
+        if self._obj_size is None:
+            self._obj_size = self._read_data_file_size()
+        return self._obj_size
+
+    def _drop_cache(self, fd, offset, length):
+        """Method for no-oping buffer cache drop method."""
+        if not self.keep_cache:
+            drop_buffer_cache(fd, offset, length)
+
     def __iter__(self):
         """Returns an iterator over the data file."""
-        if not self.fp:
-            raise DiskFileNotOpenError()
         try:
             dropped_cache = 0
             read = 0
-            self.started_at_0 = False
-            self.read_to_eof = False
+            self._started_at_0 = False
+            self._read_to_eof = False
             if self.fp.tell() == 0:
-                self.started_at_0 = True
-                self.iter_etag = hashlib.md5()
+                self._started_at_0 = True
+                self._iter_etag = hashlib.md5()
             while True:
                 chunk = self.threadpool.run_in_thread(
                     self.fp.read, self.disk_chunk_size)
                 if chunk:
-                    if self.iter_etag:
-                        self.iter_etag.update(chunk)
+                    if self._iter_etag:
+                        self._iter_etag.update(chunk)
                     read += len(chunk)
                     if read - dropped_cache > (1024 * 1024):
                         self._drop_cache(self.fp.fileno(), dropped_cache,
@@ -586,18 +599,16 @@ class DiskFile(object):
                     if self.iter_hook:
                         self.iter_hook()
                 else:
-                    self.read_to_eof = True
+                    self._read_to_eof = True
                     self._drop_cache(self.fp.fileno(), dropped_cache,
                                      read - dropped_cache)
                     break
         finally:
-            if not self.suppress_file_closing:
+            if not self._suppress_file_closing:
                 self.close()
 
     def app_iter_range(self, start, stop):
         """Returns an iterator over the data file for range (start, stop)"""
-        if not self.fp:
-            raise DiskFileNotOpenError()
         if start or start == 0:
             self.fp.seek(start)
         if stop is not None:
@@ -614,7 +625,7 @@ class DiskFile(object):
                         break
                 yield chunk
         finally:
-            if not self.suppress_file_closing:
+            if not self._suppress_file_closing:
                 self.close()
 
     def app_iter_ranges(self, ranges, content_type, boundary, size):
@@ -623,28 +634,41 @@ class DiskFile(object):
             yield ''
         else:
             try:
-                self.suppress_file_closing = True
+                self._suppress_file_closing = True
                 for chunk in multi_range_iterator(
                         ranges, content_type, boundary, size,
                         self.app_iter_range):
                     yield chunk
             finally:
-                self.suppress_file_closing = False
+                self._suppress_file_closing = False
                 self.close()
+
+    def quarantine(self):
+        """
+        In the case that a file is corrupted, move it to a quarantined
+        area to allow replication to fix it.
+
+        :returns: if quarantine is successful, path to quarantined
+                  directory otherwise None
+        """
+        if self._data_file and not self.quarantined_dir:
+            self.quarantined_dir = self.threadpool.run_in_thread(
+                quarantine_renamer, self.device_path, self._data_file)
+            self.logger.increment('quarantines')
+            return self.quarantined_dir
 
     def _handle_close_quarantine(self):
         """Check if file needs to be quarantined"""
-        try:
-            self.get_data_file_size()
-        except DiskFileNotExist:
+        if self.quarantined_dir:
             return
+        try:
+            self.get_obj_size()
         except DiskFileError:
             self.quarantine()
             return
-
-        if self.iter_etag and self.started_at_0 and self.read_to_eof and \
+        if self._iter_etag and self._started_at_0 and self._read_to_eof and \
                 'ETag' in self._metadata and \
-                self.iter_etag.hexdigest() != self._metadata.get('ETag'):
+                self._iter_etag.hexdigest() != self._metadata.get('ETag'):
             self.quarantine()
 
     def close(self, verify_file=True):
@@ -667,6 +691,67 @@ class DiskFile(object):
             finally:
                 self.fp.close()
                 self.fp = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, t, v, tb):
+        self.close(verify_file=self.verify_close)
+
+
+class DiskFile(object):
+    """
+    Manage object files on disk.
+
+    :param path: path to devices on the node
+    :param device: device name
+    :param partition: partition on the device the object lives in
+    :param account: account name for the object
+    :param container: container name for the object
+    :param obj: object name for the object
+    :param disk_chunk_size: size of chunks on file reads
+    :param bytes_per_sync: number of bytes between fdatasync calls
+    :param iter_hook: called when __iter__ returns a chunk
+    :param threadpool: thread pool in which to do blocking operations
+
+    """
+
+    def __init__(self, path, device, partition, account, container, obj,
+                 logger, disk_chunk_size=65536,
+                 bytes_per_sync=(512 * 1024 * 1024),
+                 iter_hook=None, threadpool=None, obj_dir='objects',
+                 mount_check=False):
+        if mount_check and not check_mount(path, device):
+            raise DiskFileDeviceUnavailable()
+        self.disk_chunk_size = disk_chunk_size
+        self.bytes_per_sync = bytes_per_sync
+        self.iter_hook = iter_hook
+        self.name = '/' + '/'.join((account, container, obj))
+        name_hash = hash_path(account, container, obj)
+        self.datadir = join(
+            path, device, storage_directory(obj_dir, partition, name_hash))
+        self.device_path = join(path, device)
+        self.logger = logger
+        self.threadpool = threadpool or ThreadPool(nthreads=0)
+        self._reader = None
+
+    def open(self):
+        """
+        Read metadata and prepare DiskFile for reading.
+        """
+        return DiskReader(self.device_path, self.datadir, self.name,
+                          logger=self.logger,
+                          disk_chunk_size=self.disk_chunk_size,
+                          iter_hook=self.iter_hook,
+                          threadpool=self.threadpool)
+
+    def read_metadata(self, verify_data_file_size=True):
+        with self.open() as dfr:
+            if verify_data_file_size:
+                dfr.get_obj_size()
+            else:
+                dfr.verify_close = False
+            return dfr.get_metadata()
 
     @contextmanager
     def create(self, size=None):
@@ -702,52 +787,3 @@ class DiskFile(object):
         """
         with self.create() as writer:
             writer.put_tombstone(req_timestamp)
-
-    def _drop_cache(self, fd, offset, length):
-        """Method for no-oping buffer cache drop method."""
-        if not self.keep_cache:
-            drop_buffer_cache(fd, offset, length)
-
-    def quarantine(self):
-        """
-        In the case that a file is corrupted, move it to a quarantined
-        area to allow replication to fix it.
-
-        :returns: if quarantine is successful, path to quarantined
-                  directory otherwise None
-        """
-        if not hasattr(self, '_data_file'):
-            self._find_data_file()
-        if self._data_file and not self.quarantined_dir:
-            self.quarantined_dir = self.threadpool.run_in_thread(
-                quarantine_renamer, self.device_path, self._data_file)
-            self.logger.increment('quarantines')
-            return self.quarantined_dir
-
-    def get_data_file_size(self):
-        """
-        Returns the os.path.getsize for the file.  Raises an exception if this
-        file does not match the Content-Length stored in the metadata. Or if
-        self._data_file does not exist.
-
-        :returns: file size as an int
-        :raises DiskFileError: on file size mismatch.
-        :raises DiskFileNotExist: on file not existing (including deleted)
-        """
-        if not hasattr(self, '_data_file'):
-            self._find_data_file()
-        try:
-            file_size = 0
-            file_size = self.threadpool.run_in_thread(
-                getsize, self._data_file)
-            if 'Content-Length' in self._metadata:
-                metadata_size = int(self._metadata['Content-Length'])
-                if file_size != metadata_size:
-                    raise DiskFileError(
-                        'Content-Length of %s does not match file size '
-                        'of %s' % (metadata_size, file_size))
-            return file_size
-        except OSError, err:
-            if err.errno != errno.ENOENT:
-                raise
-        raise DiskFileNotExist('Data File does not exist.')

@@ -61,10 +61,6 @@ class DiskFileExpired(_DiskFileDeletedOrExpired):
     pass
 
 
-class DiskFileNotOpenError(DiskFileError):
-    pass
-
-
 class DiskWriterNotReady(DiskFileError):
     pass
 

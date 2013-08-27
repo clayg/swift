@@ -23,7 +23,7 @@ from hashlib import md5
 from tempfile import mkdtemp
 from test.unit import FakeLogger
 from swift.obj import auditor
-from swift.obj.diskfile import DiskFile, write_metadata, invalidate_hash
+from swift.obj.diskfile import DiskFile, DiskReader, write_metadata, invalidate_hash
 from swift.obj.server import DATADIR
 from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
     storage_directory
@@ -328,22 +328,22 @@ class TestAuditor(unittest.TestCase):
     def test_object_run_fast_track_zero_check_closed(self):
         rat = [False]
 
-        class FakeFile(DiskFile):
+        class FakeReader(DiskReader):
 
             def close(self, verify_file=True):
                 rat[0] = True
-                DiskFile.close(self, verify_file=verify_file)
+                DiskReader.close(self, verify_file=verify_file)
         self.setup_bad_zero_byte()
-        was_df = auditor.diskfile.DiskFile
+        was_dfr = auditor.diskfile.DiskReader
         try:
-            auditor.diskfile.DiskFile = FakeFile
+            auditor.diskfile.DiskReader = FakeReader
             self.auditor.run_once(zero_byte_fps=50)
             quarantine_path = os.path.join(self.devices,
                                            'sda', 'quarantined', 'objects')
             self.assertTrue(os.path.isdir(quarantine_path))
             self.assertTrue(rat[0])
         finally:
-            auditor.diskfile.DiskFile = was_df
+            auditor.diskfile.DiskReader = was_dfr
 
     def test_run_forever(self):
 

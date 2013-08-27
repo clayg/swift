@@ -168,9 +168,10 @@ class AuditorWorker(object):
             df = diskfile.DiskFile(self.devices, device, partition,
                                    account, container, obj, self.logger)
             try:
+                reader = None
                 try:
-                    df.open()
-                    obj_size = df.get_data_file_size()
+                    reader = df.open()
+                    obj_size = reader.get_obj_size()
                 except DiskFileNotExist:
                     return
                 except DiskFileError as e:
@@ -180,21 +181,22 @@ class AuditorWorker(object):
                 if self.zero_byte_only_at_fps and obj_size:
                     self.passes += 1
                     return
-                for chunk in df:
+                for chunk in reader:
                     self.bytes_running_time = ratelimit_sleep(
                         self.bytes_running_time, self.max_bytes_per_second,
                         incr_by=len(chunk))
                     self.bytes_processed += len(chunk)
                     self.total_bytes_processed += len(chunk)
-                df.close()
-                if df.quarantined_dir:
+                reader.close()
+                if reader.quarantined_dir:
                     self.quarantines += 1
                     self.logger.error(
                         _("ERROR Object %(path)s failed audit and will be "
                           "quarantined: ETag and file's md5 do not match"),
                         {'path': path})
             finally:
-                df.close(verify_file=False)
+                if reader:
+                    reader.close(verify_file=False)
         except AuditException as err:
             self.logger.increment('quarantines')
             self.quarantines += 1
