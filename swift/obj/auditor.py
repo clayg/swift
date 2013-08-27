@@ -166,10 +166,10 @@ class AuditorWorker(object):
                 raise AuditException('Error when reading metadata: %s' % exc)
             _junk, account, container, obj = name.split('/', 3)
             df = diskfile.DiskFile(self.devices, device, partition,
-                                   account, container, obj, self.logger,
-                                   keep_data_fp=True)
+                                   account, container, obj, self.logger)
             try:
                 try:
+                    df.open()
                     obj_size = df.get_data_file_size()
                 except DiskFileNotExist:
                     return

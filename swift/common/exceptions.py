@@ -46,6 +46,25 @@ class DiskFileNotExist(DiskFileError):
     pass
 
 
+class _DiskFileDeletedOrExpired(DiskFileNotExist):
+
+    def __init__(self, timestamp=0, *args):
+        super(DiskFileError, self).__init__(timestamp, *args)
+        self.timestamp = timestamp
+
+
+class DiskFileDeleted(_DiskFileDeletedOrExpired):
+    pass
+
+
+class DiskFileExpired(_DiskFileDeletedOrExpired):
+    pass
+
+
+class DiskFileNotOpenError(DiskFileError):
+    pass
+
+
 class DiskFileNoSpace(DiskFileError):
     pass
 

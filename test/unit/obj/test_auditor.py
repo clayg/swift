@@ -270,18 +270,6 @@ class TestAuditor(unittest.TestCase):
     def setup_bad_zero_byte(self, with_ts=False):
         self.auditor = auditor.ObjectAuditor(self.conf)
         self.auditor.log_time = 0
-        ts_file_path = ''
-        if with_ts:
-
-            name_hash = hash_path('a', 'c', 'o')
-            dir_path = os.path.join(self.devices, 'sda',
-                               storage_directory(DATADIR, '0', name_hash))
-            ts_file_path = os.path.join(dir_path, '99999.ts')
-            if not os.path.exists(dir_path):
-                mkdirs(dir_path)
-            fp = open(ts_file_path, 'w')
-            fp.close()
-
         etag = md5()
         with self.disk_file.writer() as writer:
             etag = etag.hexdigest()
@@ -295,9 +283,18 @@ class TestAuditor(unittest.TestCase):
             etag = etag.hexdigest()
             metadata['ETag'] = etag
             write_metadata(writer.fd, metadata)
-        if self.disk_file.data_file:
-            return self.disk_file.data_file
-        return ts_file_path
+        if with_ts:
+            name_hash = hash_path('a', 'c', 'o')
+            dir_path = os.path.join(self.devices, 'sda',
+                               storage_directory(DATADIR, '0', name_hash))
+            ts_file_path = os.path.join(dir_path, '99999.ts')
+            if not os.path.exists(dir_path):
+                mkdirs(dir_path)
+            fp = open(ts_file_path, 'w')
+            fp.close()
+            return ts_file_path
+        else:
+            return self.disk_file._data_file
 
     def test_object_run_fast_track_all(self):
         self.setup_bad_zero_byte()

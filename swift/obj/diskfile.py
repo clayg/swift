@@ -37,7 +37,8 @@ from swift.common.utils import mkdirs, normalize_timestamp, \
     storage_directory, hash_path, renamer, fallocate, fsync, \
     fdatasync, drop_buffer_cache, ThreadPool, lock_path, write_pickle
 from swift.common.exceptions import DiskFileError, DiskFileNotExist, \
-    DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
+    DiskFileCollision, DiskFileDeleted, DiskFileExpired, \
+    DiskFileNotOpenError, DiskFileNoSpace, DiskFileDeviceUnavailable, \
     PathNotDir
 from swift.common.swob import multi_range_iterator
 
@@ -324,11 +325,12 @@ class DiskWriter(object):
             invalidate_hash(dirname(self.disk_file.datadir))
             # After the rename completes, this object will be available for
             # other requests to reference.
-            renamer(self.tmppath, join(self.disk_file.datadir,
-                                       timestamp + extension))
+            data_file = join(self.disk_file.datadir, timestamp + extension)
+            renamer(self.tmppath, data_file)
+            self.disk_file._data_file = data_file
 
         self.threadpool.force_run_in_thread(finalize_put)
-        self.disk_file.metadata = metadata
+        self.disk_file._metadata = metadata
 
 
 class DiskFile(object):
@@ -347,13 +349,13 @@ class DiskFile(object):
     :param iter_hook: called when __iter__ returns a chunk
     :param threadpool: thread pool in which to do blocking operations
 
-    :raises DiskFileCollision: on md5 collision
     """
 
     def __init__(self, path, device, partition, account, container, obj,
-                 logger, keep_data_fp=False, disk_chunk_size=65536,
-                 bytes_per_sync=(512 * 1024 * 1024), iter_hook=None,
-                 threadpool=None, obj_dir='objects', mount_check=False):
+                 logger, disk_chunk_size=65536,
+                 bytes_per_sync=(512 * 1024 * 1024),
+                 iter_hook=None, threadpool=None, obj_dir='objects',
+                 mount_check=False):
         if mount_check and not check_mount(path, device):
             raise DiskFileDeviceUnavailable()
         self.disk_chunk_size = disk_chunk_size
@@ -366,8 +368,6 @@ class DiskFile(object):
         self.device_path = join(path, device)
         self.tmpdir = join(path, device, 'tmp')
         self.logger = logger
-        self.metadata = {}
-        self.data_file = None
         self.fp = None
         self.iter_etag = None
         self.started_at_0 = False
@@ -376,50 +376,114 @@ class DiskFile(object):
         self.keep_cache = False
         self.suppress_file_closing = False
         self.threadpool = threadpool or ThreadPool(nthreads=0)
+
+    def _find_data_file(self):
         if not exists(self.datadir):
-            return
+            raise DiskFileNotExist()
         files = sorted(os.listdir(self.datadir), reverse=True)
-        meta_file = None
         for afile in files:
             if afile.endswith('.ts'):
-                self.data_file = None
+                self._data_file = None
                 with open(join(self.datadir, afile)) as mfp:
-                    self.metadata = read_metadata(mfp)
-                self.metadata['deleted'] = True
+                    metadata = read_metadata(mfp)
+                metadata['deleted'] = True
+                raise DiskFileDeleted(metadata['X-Timestamp'])
+            if afile.endswith('.meta') and not hasattr(self, '_meta_file'):
+                self._meta_file = join(self.datadir, afile)
+            if afile.endswith('.data') and not hasattr(self, '_data_file'):
+                self._data_file = join(self.datadir, afile)
                 break
-            if afile.endswith('.meta') and not meta_file:
-                meta_file = join(self.datadir, afile)
-            if afile.endswith('.data') and not self.data_file:
-                self.data_file = join(self.datadir, afile)
-                break
-        if not self.data_file:
-            return
-        self.fp = open(self.data_file, 'rb')
-        datafile_metadata = read_metadata(self.fp)
-        if not keep_data_fp:
-            self.close(verify_file=False)
+        if not hasattr(self, '_data_file'):
+            raise DiskFileNotExist()
 
-        if meta_file:
-            with open(meta_file) as mfp:
-                self.metadata = read_metadata(mfp)
+    def open(self):
+        """
+        Read metadata and prepare DiskFile for reading.
+
+        :raises DiskFileNotExist: if the data file can't be found
+        :raises DiskFileDeleted: if the object is deleted
+        :raises DiskFileExpired: if the object is expired
+        :raises DiskFileCollision: on md5 collision
+        """
+        self._find_data_file()
+        self.fp = open(self._data_file, 'rb')
+        self._metadata = self.read_metadata()
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, t, v, tb):
+        self.close()
+
+    def read_metadata(self):
+        if self.fp:
+            datafile_metadata = read_metadata(self.fp)
+        else:
+            if not hasattr(self, '_data_file'):
+                self._find_data_file()
+            with open(self._data_file) as dfp:
+                datafile_metadata = read_metadata(dfp)
+
+        if hasattr(self, '_meta_file'):
+            with open(self._meta_file) as mfp:
+                metadata = read_metadata(mfp)
             sys_metadata = dict(
                 [(key, val) for key, val in datafile_metadata.iteritems()
                  if key.lower() in DATAFILE_SYSTEM_META])
-            self.metadata.update(sys_metadata)
+            metadata.update(sys_metadata)
         else:
-            self.metadata = datafile_metadata
+            metadata = datafile_metadata
 
-        if 'name' in self.metadata:
-            if self.metadata['name'] != self.name:
-                self.logger.error(_('Client path %(client)s does not match '
-                                    'path stored in object metadata %(meta)s'),
-                                  {'client': self.name,
-                                   'meta': self.metadata['name']})
-                raise DiskFileCollision('Client path does not match path '
-                                        'stored in object metadata')
+        self._check_metadata(metadata)
+        return metadata
+
+    def _check_metadata(self, metadata):
+        """
+        :raises DiskFileDeleted: if the object is deleted
+        :raises DiskFileExpired: if the object is expired
+        :raises DiskFileCollision: on md5 collision
+        """
+        self._check_collision(metadata)
+        self._check_deleted(metadata)
+        self._check_expired(metadata)
+
+    def _check_collision(self, metadata):
+        """
+        :raises DiskFileCollision: on md5 collision
+        """
+        if 'name' in metadata and metadata['name'] != self.name:
+            self.logger.error(_('Client path %(client)s does not match path '
+                                'stored in object metadata %(meta)s'),
+                              {'client': self.name, 'meta': metadata['name']})
+            raise DiskFileCollision('Client path does not match path stored '
+                                    'in object metadata')
+
+    def _check_expired(self, metadata):
+        """
+        :raises DiskFileExpired: if the object is expired
+        """
+        if ('X-Delete-At' in metadata and
+                int(metadata['X-Delete-At']) <= time.time()):
+            raise DiskFileExpired(metadata['X-Delete-At'])
+
+    def _check_deleted(self, metadata):
+        """
+        :raises DiskFileDeleted: if the object is deleted
+        """
+        if 'deleted' in metadata:
+            raise DiskFileDeleted(metadata['X-Timestamp'])
+
+    @property
+    def metadata(self):
+        if not hasattr(self, '_metadata'):
+            self._metadata = self.read_metadata()
+        return self._metadata
 
     def __iter__(self):
         """Returns an iterator over the data file."""
+        if not self.fp:
+            raise DiskFileNotOpenError()
         try:
             dropped_cache = 0
             read = 0
@@ -453,6 +517,8 @@ class DiskFile(object):
 
     def app_iter_range(self, start, stop):
         """Returns an iterator over the data file for range (start, stop)"""
+        if not self.fp:
+            raise DiskFileNotOpenError()
         if start or start == 0:
             self.fp.seek(start)
         if stop is not None:
@@ -516,30 +582,12 @@ class DiskFile(object):
             except (Exception, Timeout), e:
                 self.logger.error(_(
                     'ERROR DiskFile %(data_file)s in '
-                    '%(data_dir)s close failure: %(exc)s : %(stack)'),
+                    '%(data_dir)s close failure: %(exc)s : %(stack)s'),
                     {'exc': e, 'stack': ''.join(traceback.format_stack()),
-                     'data_file': self.data_file, 'data_dir': self.datadir})
+                     'data_file': self._data_file, 'data_dir': self.datadir})
             finally:
                 self.fp.close()
                 self.fp = None
-
-    def is_deleted(self):
-        """
-        Check if the file is deleted.
-
-        :returns: True if the file doesn't exist or has been flagged as
-                  deleted.
-        """
-        return not self.data_file or 'deleted' in self.metadata
-
-    def is_expired(self):
-        """
-        Check if the file is expired.
-
-        :returns: True if the file has an X-Delete-At in the past
-        """
-        return ('X-Delete-At' in self.metadata and
-                int(self.metadata['X-Delete-At']) <= time.time())
 
     @contextmanager
     def writer(self, size=None):
@@ -614,9 +662,11 @@ class DiskFile(object):
         :returns: if quarantine is successful, path to quarantined
                   directory otherwise None
         """
-        if not (self.is_deleted() or self.quarantined_dir):
+        if not hasattr(self, '_data_file'):
+            self._find_data_file()
+        if self._data_file and not self.quarantined_dir:
             self.quarantined_dir = self.threadpool.run_in_thread(
-                quarantine_renamer, self.device_path, self.data_file)
+                quarantine_renamer, self.device_path, self._data_file)
             self.logger.increment('quarantines')
             return self.quarantined_dir
 
@@ -624,24 +674,25 @@ class DiskFile(object):
         """
         Returns the os.path.getsize for the file.  Raises an exception if this
         file does not match the Content-Length stored in the metadata. Or if
-        self.data_file does not exist.
+        self._data_file does not exist.
 
         :returns: file size as an int
         :raises DiskFileError: on file size mismatch.
         :raises DiskFileNotExist: on file not existing (including deleted)
         """
+        if not hasattr(self, '_data_file'):
+            self._find_data_file()
         try:
             file_size = 0
-            if self.data_file:
-                file_size = self.threadpool.run_in_thread(
-                    getsize, self.data_file)
-                if 'Content-Length' in self.metadata:
-                    metadata_size = int(self.metadata['Content-Length'])
-                    if file_size != metadata_size:
-                        raise DiskFileError(
-                            'Content-Length of %s does not match file size '
-                            'of %s' % (metadata_size, file_size))
-                return file_size
+            file_size = self.threadpool.run_in_thread(
+                getsize, self._data_file)
+            if 'Content-Length' in self.metadata:
+                metadata_size = int(self.metadata['Content-Length'])
+                if file_size != metadata_size:
+                    raise DiskFileError(
+                        'Content-Length of %s does not match file size '
+                        'of %s' % (metadata_size, file_size))
+            return file_size
         except OSError, err:
             if err.errno != errno.ENOENT:
                 raise

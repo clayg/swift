@@ -357,13 +357,14 @@ class TestObjectController(unittest.TestCase):
         resp = req.get_response(self.object_controller)
         self.assertEquals(resp.status_int, 201)
         file = diskfile.DiskFile(self.testdir, 'sda1', 'p', 'a', 'c', 'o',
-                                      FakeLogger(), keep_data_fp=True)
-
-        file_name = os.path.basename(file.data_file)
-        with open(file.data_file) as fp:
+                                      FakeLogger())
+        with file.open():
+            pass
+        file_name = os.path.basename(file._data_file)
+        with open(file._data_file) as fp:
             metadata = diskfile.read_metadata(fp)
-        os.unlink(file.data_file)
-        with open(file.data_file, 'w') as fp:
+        os.unlink(file._data_file)
+        with open(file._data_file, 'w') as fp:
             diskfile.write_metadata(fp, metadata)
 
         self.assertEquals(os.listdir(file.datadir)[0], file_name)
@@ -373,7 +374,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEquals(resp.status_int, 404)
 
         quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
-                       os.path.basename(os.path.dirname(file.data_file)))
+                       os.path.basename(os.path.dirname(file._data_file)))
         self.assertEquals(os.listdir(quar_dir)[0], file_name)
 
     def test_PUT_invalid_path(self):
@@ -687,13 +688,14 @@ class TestObjectController(unittest.TestCase):
         resp = req.get_response(self.object_controller)
         self.assertEquals(resp.status_int, 201)
         file = diskfile.DiskFile(self.testdir, 'sda1', 'p', 'a', 'c', 'o',
-                                      FakeLogger(), keep_data_fp=True)
-
-        file_name = os.path.basename(file.data_file)
-        with open(file.data_file) as fp:
+                                      FakeLogger())
+        with file.open():
+            pass
+        file_name = os.path.basename(file._data_file)
+        with open(file._data_file) as fp:
             metadata = diskfile.read_metadata(fp)
-        os.unlink(file.data_file)
-        with open(file.data_file, 'w') as fp:
+        os.unlink(file._data_file)
+        with open(file._data_file, 'w') as fp:
             diskfile.write_metadata(fp, metadata)
 
         self.assertEquals(os.listdir(file.datadir)[0], file_name)
@@ -702,7 +704,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEquals(resp.status_int, 404)
 
         quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
-                       os.path.basename(os.path.dirname(file.data_file)))
+                       os.path.basename(os.path.dirname(file._data_file)))
         self.assertEquals(os.listdir(quar_dir)[0], file_name)
 
     def test_GET(self):
@@ -976,26 +978,28 @@ class TestObjectController(unittest.TestCase):
         resp = req.get_response(self.object_controller)
         self.assertEquals(resp.status_int, 201)
         file = diskfile.DiskFile(self.testdir, 'sda1', 'p', 'a', 'c', 'o',
-                                      FakeLogger(), keep_data_fp=True)
-        file_name = os.path.basename(file.data_file)
-        etag = md5()
-        etag.update('VERIF')
-        etag = etag.hexdigest()
-        metadata = {'X-Timestamp': timestamp,
-                    'Content-Length': 6, 'ETag': etag}
-        diskfile.write_metadata(file.fp, metadata)
-        self.assertEquals(os.listdir(file.datadir)[0], file_name)
-        req = Request.blank('/sda1/p/a/c/o')
-        resp = req.get_response(self.object_controller)
-        quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
-                       os.path.basename(os.path.dirname(file.data_file)))
-        self.assertEquals(os.listdir(file.datadir)[0], file_name)
-        body = resp.body  # actually does quarantining
-        self.assertEquals(body, 'VERIFY')
-        self.assertEquals(os.listdir(quar_dir)[0], file_name)
-        req = Request.blank('/sda1/p/a/c/o')
-        resp = req.get_response(self.object_controller)
-        self.assertEquals(resp.status_int, 404)
+                                      FakeLogger())
+        with file.open():
+            file_name = os.path.basename(file._data_file)
+            etag = md5()
+            etag.update('VERIF')
+            etag = etag.hexdigest()
+            metadata = {'X-Timestamp': timestamp,
+                        'Content-Length': 6, 'ETag': etag}
+            diskfile.write_metadata(file.fp, metadata)
+            self.assertEquals(os.listdir(file.datadir)[0], file_name)
+            req = Request.blank('/sda1/p/a/c/o')
+            resp = req.get_response(self.object_controller)
+            quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined',
+                                    'objects', os.path.basename(
+                                        os.path.dirname(file._data_file)))
+            self.assertEquals(os.listdir(file.datadir)[0], file_name)
+            body = resp.body  # actually does quarantining
+            self.assertEquals(body, 'VERIFY')
+            self.assertEquals(os.listdir(quar_dir)[0], file_name)
+            req = Request.blank('/sda1/p/a/c/o')
+            resp = req.get_response(self.object_controller)
+            self.assertEquals(resp.status_int, 404)
 
     def test_GET_quarantine_zbyte(self):
         """ Test swift.object_server.ObjectController.GET """
@@ -1007,22 +1011,23 @@ class TestObjectController(unittest.TestCase):
         resp = req.get_response(self.object_controller)
         self.assertEquals(resp.status_int, 201)
         file = diskfile.DiskFile(self.testdir, 'sda1', 'p', 'a', 'c', 'o',
-                                      FakeLogger(), keep_data_fp=True)
-        file_name = os.path.basename(file.data_file)
-        with open(file.data_file) as fp:
-            metadata = diskfile.read_metadata(fp)
-        os.unlink(file.data_file)
-        with open(file.data_file, 'w') as fp:
-            diskfile.write_metadata(fp, metadata)
+                                      FakeLogger())
+        with file.open():
+            file_name = os.path.basename(file._data_file)
+            with open(file._data_file) as fp:
+                metadata = diskfile.read_metadata(fp)
+            os.unlink(file._data_file)
+            with open(file._data_file, 'w') as fp:
+                diskfile.write_metadata(fp, metadata)
 
-        self.assertEquals(os.listdir(file.datadir)[0], file_name)
-        req = Request.blank('/sda1/p/a/c/o')
-        resp = req.get_response(self.object_controller)
-        self.assertEquals(resp.status_int, 404)
+            self.assertEquals(os.listdir(file.datadir)[0], file_name)
+            req = Request.blank('/sda1/p/a/c/o')
+            resp = req.get_response(self.object_controller)
+            self.assertEquals(resp.status_int, 404)
 
-        quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
-                       os.path.basename(os.path.dirname(file.data_file)))
-        self.assertEquals(os.listdir(quar_dir)[0], file_name)
+            quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
+                           os.path.basename(os.path.dirname(file._data_file)))
+            self.assertEquals(os.listdir(quar_dir)[0], file_name)
 
     def test_GET_quarantine_range(self):
         """ Test swift.object_server.ObjectController.GET """
@@ -1034,47 +1039,48 @@ class TestObjectController(unittest.TestCase):
         resp = req.get_response(self.object_controller)
         self.assertEquals(resp.status_int, 201)
         file = diskfile.DiskFile(self.testdir, 'sda1', 'p', 'a', 'c', 'o',
-                                      FakeLogger(), keep_data_fp=True)
-        file_name = os.path.basename(file.data_file)
-        etag = md5()
-        etag.update('VERIF')
-        etag = etag.hexdigest()
-        metadata = {'X-Timestamp': timestamp,
-                    'Content-Length': 6, 'ETag': etag}
-        diskfile.write_metadata(file.fp, metadata)
-        self.assertEquals(os.listdir(file.datadir)[0], file_name)
-        req = Request.blank('/sda1/p/a/c/o')
-        req.range = 'bytes=0-4'  # partial
-        resp = req.get_response(self.object_controller)
-        quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
-                            os.path.basename(os.path.dirname(file.data_file)))
-        resp.body
-        self.assertEquals(os.listdir(file.datadir)[0], file_name)
-        self.assertFalse(os.path.isdir(quar_dir))
-        req = Request.blank('/sda1/p/a/c/o')
-        resp = req.get_response(self.object_controller)
-        self.assertEquals(resp.status_int, 200)
+                                      FakeLogger())
+        with file.open():
+            file_name = os.path.basename(file._data_file)
+            etag = md5()
+            etag.update('VERIF')
+            etag = etag.hexdigest()
+            metadata = {'X-Timestamp': timestamp,
+                        'Content-Length': 6, 'ETag': etag}
+            diskfile.write_metadata(file.fp, metadata)
+            self.assertEquals(os.listdir(file.datadir)[0], file_name)
+            req = Request.blank('/sda1/p/a/c/o')
+            req.range = 'bytes=0-4'  # partial
+            resp = req.get_response(self.object_controller)
+            quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
+                                os.path.basename(os.path.dirname(file._data_file)))
+            resp.body
+            self.assertEquals(os.listdir(file.datadir)[0], file_name)
+            self.assertFalse(os.path.isdir(quar_dir))
+            req = Request.blank('/sda1/p/a/c/o')
+            resp = req.get_response(self.object_controller)
+            self.assertEquals(resp.status_int, 200)
 
-        req = Request.blank('/sda1/p/a/c/o')
-        req.range = 'bytes=1-6'  # partial
-        resp = req.get_response(self.object_controller)
-        quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
-                            os.path.basename(os.path.dirname(file.data_file)))
-        resp.body
-        self.assertEquals(os.listdir(file.datadir)[0], file_name)
-        self.assertFalse(os.path.isdir(quar_dir))
+            req = Request.blank('/sda1/p/a/c/o')
+            req.range = 'bytes=1-6'  # partial
+            resp = req.get_response(self.object_controller)
+            quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
+                                os.path.basename(os.path.dirname(file._data_file)))
+            resp.body
+            self.assertEquals(os.listdir(file.datadir)[0], file_name)
+            self.assertFalse(os.path.isdir(quar_dir))
 
-        req = Request.blank('/sda1/p/a/c/o')
-        req.range = 'bytes=0-14'  # full
-        resp = req.get_response(self.object_controller)
-        quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
-                       os.path.basename(os.path.dirname(file.data_file)))
-        self.assertEquals(os.listdir(file.datadir)[0], file_name)
-        resp.body
-        self.assertTrue(os.path.isdir(quar_dir))
-        req = Request.blank('/sda1/p/a/c/o')
-        resp = req.get_response(self.object_controller)
-        self.assertEquals(resp.status_int, 404)
+            req = Request.blank('/sda1/p/a/c/o')
+            req.range = 'bytes=0-14'  # full
+            resp = req.get_response(self.object_controller)
+            quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
+                           os.path.basename(os.path.dirname(file._data_file)))
+            self.assertEquals(os.listdir(file.datadir)[0], file_name)
+            resp.body
+            self.assertTrue(os.path.isdir(quar_dir))
+            req = Request.blank('/sda1/p/a/c/o')
+            resp = req.get_response(self.object_controller)
+            self.assertEquals(resp.status_int, 404)
 
     def test_DELETE(self):
         # Test swift.object_server.ObjectController.DELETE
