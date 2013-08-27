@@ -605,8 +605,7 @@ class ObjectController(object):
             self.delete_at_update('DELETE', old_delete_at,
                                   account, container, obj,
                                   request, device)
-        disk_file.put_metadata({'X-Timestamp': req_timestamp}, tombstone=True)
-        disk_file.unlinkold(req_timestamp)
+        disk_file.delete(req_timestamp)
         self.container_update(
             'DELETE', account, container, obj, request,
             HeaderKeyDict({'x-timestamp': req_timestamp}),

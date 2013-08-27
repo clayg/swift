@@ -649,6 +649,15 @@ class DiskFile(object):
                             raise
         self.threadpool.run_in_thread(_unlinkold)
 
+    def delete(self, req_timestamp):
+        """
+        Write out tombstone and unlink old files.
+
+        :param req_timestamp: timestamp of the request to delete object
+        """
+        self.put_metadata({'X-Timestamp': req_timestamp}, tombstone=True)
+        self.unlinkold(req_timestamp)
+
     def _drop_cache(self, fd, offset, length):
         """Method for no-oping buffer cache drop method."""
         if not self.keep_cache:
