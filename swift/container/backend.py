@@ -230,15 +230,16 @@ class ContainerBroker(DatabaseBroker):
                 'SELECT object_count from container_stat').fetchone()
             return (row[0] == 0)
 
-    def delete_object(self, name, timestamp):
+    def delete_object(self, name, timestamp, storage_policy_index):
         """
         Mark an object deleted.
 
         :param name: object name to be deleted
         :param timestamp: timestamp when the object was marked as deleted
+        :param storage_policy_index: object's storage policy index
         """
         self.put_object(name, timestamp, 0, 'application/deleted', 'noetag',
-                        -1, 1)
+                        storage_policy_index, deleted=1)
 
     def put_object(self, name, timestamp, size, content_type, etag,
                    storage_policy_index, deleted=0):
@@ -250,6 +251,7 @@ class ContainerBroker(DatabaseBroker):
         :param size: object size
         :param content_type: object content-type
         :param etag: object etag
+        :param storage_policy_index: object's storage policy index
         :param deleted: if True, marks the object as deleted and sets the
                         deleted_at timestamp to timestamp
         """
@@ -438,6 +440,28 @@ class ContainerBroker(DatabaseBroker):
             ''', (put_timestamp, delete_timestamp, object_count, bytes_used))
             conn.commit()
 
+    def list_cleanups(self, limit):
+        """
+        Get a list of cleanups ordered by name.
+
+        :param limit: maximum number of entries to get
+        """
+        query = """
+            SELECT name, created_at, storage_policy_index
+            FROM object_cleanup
+            ORDER BY name, created_at, storage_policy_index
+            LIMIT ?
+        """
+
+        with self.get() as conn:
+            try:
+                return [dict(row) for row in
+                        conn.execute(query, (limit,)).fetchall()]
+            except sqlite3.OperationalError as err:
+                if "no such table: object_cleanup" not in str(err):
+                    raise
+                return []
+
     def list_objects_iter(self, limit, marker, end_marker, prefix, delimiter,
                           path=None):
         """
@@ -542,6 +566,27 @@ class ContainerBroker(DatabaseBroker):
                     break
             return results
 
+    # XXX test meeeee
+    def list_misplaced_objects(self, limit):
+        """
+        Get a list of objects sorted by name which are in a storage policy
+        different from the container's storage policy.
+
+        :param limit: maximum number of entries to get
+
+        :returns: list of tuples of (name, created_at, size, content_type,
+                  etag, storage_policy_index)
+        """
+        query = '''
+            SELECT name, created_at, size, content_type, etag,
+                   storage_policy_index
+            FROM object WHERE storage_policy_index != (
+                SELECT storage_policy_index FROM container_stat LIMIT 1)
+            LIMIT ?
+        '''
+        with self.get() as conn:
+            return conn.execute(query, (limit,)).fetchall()
+
     def merge_items(self, item_list, source=None):
         """
         Merge items into the object table.
@@ -557,14 +602,59 @@ class ContainerBroker(DatabaseBroker):
                 query = '''
                     DELETE FROM object
                     WHERE name = ? AND (created_at < ?)
+                    AND storage_policy_index = ?
                 '''
                 if self.get_db_version(conn) >= 1:
                     query += ' AND deleted IN (0, 1)'
-                conn.execute(query, (rec['name'], rec['created_at']))
-                query = 'SELECT 1 FROM object WHERE name = ?'
+                conn.execute(query, (rec['name'], rec['created_at'],
+                                     rec['storage_policy_index']))
+                query = '''
+                    SELECT created_at, storage_policy_index, deleted
+                    FROM object
+                    WHERE name = ?
+                '''
                 if self.get_db_version(conn) >= 1:
                     query += ' AND deleted IN (0, 1)'
-                if not conn.execute(query, (rec['name'],)).fetchall():
+                results = conn.execute(query, (rec['name'],)).fetchall()
+                if not results:
+                    # Either there was no object row to delete, or it was old
+                    # and its storage policy index matched. In either case,
+                    # we can now insert the new row without collision.
+                    conn.execute('''
+                        INSERT INTO object (name, created_at, size,
+                            content_type, etag, storage_policy_index, deleted)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', ([rec['name'], rec['created_at'], rec['size'],
+                           rec['content_type'], rec['etag'],
+                           rec['storage_policy_index'], rec['deleted']]))
+                elif results[0]['created_at'] >= rec['created_at']:
+                    if (results[0]['storage_policy_index'] !=
+                            rec['storage_policy_index']):
+                        # This update is from the past, but it's telling us
+                        # about an object in a different storage policy. That
+                        # has to get cleaned up lest it occupy disk forever.
+                        self._insert_object_cleanup_row(
+                            conn, rec['name'],
+                            results[0]['created_at'],
+                            results[0]['storage_policy_index'])
+                    else:
+                        # This update is not newer than what we have, and it
+                        # didn't change storage policy. Ignore it.
+                        pass
+                else:
+                    # This update is newer than what we have but it's changing
+                    # the storage_policy_index of the object, so we need to
+                    # make sure the old object gets deleted (if it's not
+                    # already deleted).
+                    if not results[0]['deleted']:
+                        self._insert_object_cleanup_row(
+                            conn, rec['name'],
+                            results[0]['created_at'],
+                            results[0]['storage_policy_index'])
+                    conn.execute('''
+                        DELETE FROM object
+                        WHERE name = ?
+                    ''', [rec['name']])
                     conn.execute('''
                         INSERT INTO object (name, created_at, size,
                             content_type, etag, storage_policy_index, deleted)
@@ -591,10 +681,55 @@ class ContainerBroker(DatabaseBroker):
             try:
                 _really_merge_items(conn)
             except sqlite3.OperationalError as err:
-                if 'has no column named storage_policy_index' not in str(err):
+                if 'no such column: storage_policy_index' not in str(err):
                     raise
                 self._migrate_add_storage_policy_index(conn)
                 _really_merge_items(conn)
+
+    def delete_cleanup(self, cleanup):
+        """
+        Delete an object_cleanup row. If said row doesn't exist, do nothing.
+
+        :param cleanup: cleanup record as returned from list_cleanups()
+        """
+        query = """
+            DELETE FROM object_cleanup
+            WHERE name = ? AND created_at = ? AND storage_policy_index = ?
+        """
+        with self.get() as conn:
+            conn.execute(query, (cleanup['name'], cleanup['created_at'],
+                                 cleanup['storage_policy_index']))
+            conn.commit()
+
+    def _insert_object_cleanup_row(self, conn, name, created_at,
+                                   storage_policy_index):
+        """
+        Create an entry in the object_cleanup table, creating the table
+        if necessary.
+
+        Note that the table is not created at DB initialization time because
+        it's only used in recovering from an uncommon scenario, so most
+        containers should never have this happen.
+        """
+
+        query = '''
+            INSERT INTO object_cleanup (name, created_at, storage_policy_index)
+            VALUES (?, ?, ?)
+        '''
+        try:
+            conn.execute(query, (name, created_at, storage_policy_index))
+        except sqlite3.OperationalError as err:
+            if "no such table: object_cleanup" not in str(err):
+                print str(err)
+                raise
+            conn.execute('''
+                CREATE TABLE object_cleanup (
+                    ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    created_at TEXT,
+                    storage_policy_index INTEGER)
+            ''')
+            conn.execute(query, (name, created_at, storage_policy_index))
 
     def _migrate_add_storage_policy_index(self, conn):
         """

@@ -239,7 +239,11 @@ class ContainerController(object):
         if not os.path.exists(broker.db_file):
             return HTTPNotFound()
         if obj:     # delete object
-            broker.delete_object(obj, req.headers.get('x-timestamp'))
+            policy_index = self.get_and_validate_policy_index(req)
+            if policy_index is None:
+                policy_index = 0
+            broker.delete_object(obj, req.headers.get('x-timestamp'),
+                                 policy_index)
             return HTTPNoContent(request=req)
         else:
             # delete container

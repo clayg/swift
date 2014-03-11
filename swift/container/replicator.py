@@ -29,3 +29,19 @@ class ContainerReplicator(db_replicator.Replicator):
             if full_info['reported_' + key] != full_info[key]:
                 return False
         return True
+
+    def should_delete_db(self, broker, responses, shouldbehere):
+        """
+        Returns whether or not to keep this DB on this system after replicating
+        it to all (other) primary nodes.
+
+        If a DB has cleanup records in it, we keep it.
+        """
+        drop = super(ContainerReplicator, self).should_delete_db(
+            broker, responses, shouldbehere)
+        if not drop:
+            # skip the expensive check if possible
+            return drop
+        else:
+            cleanups = broker.list_cleanups(limit=1)
+            return not any(cleanups)

@@ -95,7 +95,7 @@ class TestContainerBroker(unittest.TestCase):
                           'd41d8cd98f00b204e9800998ecf8427e', 0)
         self.assert_(not broker.empty())
         sleep(.00001)
-        broker.delete_object('o', normalize_timestamp(time()))
+        broker.delete_object('o', normalize_timestamp(time()), 0)
         self.assert_(broker.empty())
 
     def test_reclaim(self):
@@ -120,7 +120,7 @@ class TestContainerBroker(unittest.TestCase):
                 "SELECT count(*) FROM object "
                 "WHERE deleted = 1").fetchone()[0], 0)
         sleep(.00001)
-        broker.delete_object('o', normalize_timestamp(time()))
+        broker.delete_object('o', normalize_timestamp(time()), 0)
         with broker.get() as conn:
             self.assertEquals(conn.execute(
                 "SELECT count(*) FROM object "
@@ -172,7 +172,7 @@ class TestContainerBroker(unittest.TestCase):
                 "SELECT count(*) FROM object "
                 "WHERE deleted = 1").fetchone()[0], 0)
         sleep(.00001)
-        broker.delete_object('o', normalize_timestamp(time()))
+        broker.delete_object('o', normalize_timestamp(time()), 0)
         with broker.get() as conn:
             self.assertEquals(conn.execute(
                 "SELECT count(*) FROM object "
@@ -180,6 +180,42 @@ class TestContainerBroker(unittest.TestCase):
             self.assertEquals(conn.execute(
                 "SELECT count(*) FROM object "
                 "WHERE deleted = 1").fetchone()[0], 1)
+
+    def test_delete_misplaced_object_makes_cleanups(self):
+        broker = ContainerBroker(':memory:', account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), 0)
+        broker.put_object('o', normalize_timestamp('2'), 0, 'text/plain',
+                          'd41d8cd98f00b204e9800998ecf8427e', 0)
+        self.assertEqual(len(broker.list_cleanups(10000)), 0)  # sanity check
+
+        # now it's been deleted, but from a different policy than it started
+        # in, so we'll note that someone has to go clean up the old object
+        broker.delete_object('o', normalize_timestamp('3'), 282)
+        cleanups = broker.list_cleanups(10000)
+        self.assertEqual(len(cleanups), 1)
+        self.assertEqual(cleanups[0]['name'], 'o')
+        self.assertEqual(cleanups[0]['created_at'], normalize_timestamp('2'))
+        self.assertEqual(cleanups[0]['storage_policy_index'], 0)
+
+        # deleting an already-deleted object doesn't make cleanup records
+        broker.delete_object('o', normalize_timestamp('4'), 148)
+        cleanups = broker.list_cleanups(10000)
+        self.assertEqual(len(cleanups), 1)
+
+        # if a PUT from the past in a different policy comes in, make a
+        # cleanup record
+        broker.put_object('o2', normalize_timestamp('10'), 0, 'text/plain',
+                          'd41d8cd98f00b204e9800998ecf8427e', 1)
+        broker.put_object('o2', normalize_timestamp('9.99'), 0, 'text/plain',
+                          'd41d8cd98f00b204e9800998ecf8427e', 0)
+        cleanups = broker.list_cleanups(10000)
+        self.assertEqual(len(cleanups), 2)
+
+        # DELETEs from the past don't make cleanups
+        broker.put_object('o3', normalize_timestamp('10'), 0, 'text/plain',
+                          'd41d8cd98f00b204e9800998ecf8427e', 1)
+        broker.delete_object('o3', normalize_timestamp('9.99'), 0)
+        self.assertEqual(len(cleanups), 2)
 
     def test_put_object(self):
         # Test ContainerBroker.put_object
@@ -421,6 +457,20 @@ class TestContainerBroker(unittest.TestCase):
              {'name': 'obj', 'created_at': normalize_timestamp(300),
               'storage_policy_index': wrong_policy}])
 
+        # and we can delete the cleanups
+        broker.delete_cleanup({'name': 'obj',
+                               'created_at': normalize_timestamp(200),
+                               'storage_policy_index': right_policy})
+        self.assertEqual(
+            broker.list_cleanups(10000),
+            [{'name': 'obj', 'created_at': normalize_timestamp(300),
+              'storage_policy_index': wrong_policy}])
+
+        broker.delete_cleanup({'name': 'obj',
+                               'created_at': normalize_timestamp(300),
+                               'storage_policy_index': wrong_policy})
+        self.assertEqual(broker.list_cleanups(10000), [])
+
     def test_setting_policy_delayed(self):
         # in-memory DBs take a different code path to get to merge_items than
         # on-disk ones do, so we set up an on-disk DB
@@ -506,13 +556,13 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEquals(info['bytes_used'], 1123)
 
         sleep(.00001)
-        broker.delete_object('o1', normalize_timestamp(time()))
+        broker.delete_object('o1', normalize_timestamp(time()), 0)
         info = broker.get_info()
         self.assertEquals(info['object_count'], 1)
         self.assertEquals(info['bytes_used'], 1000)
 
         sleep(.00001)
-        broker.delete_object('o2', normalize_timestamp(time()))
+        broker.delete_object('o2', normalize_timestamp(time()), 0)
         info = broker.get_info()
         self.assertEquals(info['object_count'], 0)
         self.assertEquals(info['bytes_used'], 0)
@@ -587,7 +637,7 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEquals(info['reported_bytes_used'], 1123)
 
         sleep(.00001)
-        broker.delete_object('o1', normalize_timestamp(time()))
+        broker.delete_object('o1', normalize_timestamp(time()), 0)
         info = broker.get_info()
         self.assertEquals(info['object_count'], 1)
         self.assertEquals(info['bytes_used'], 1000)
@@ -595,7 +645,7 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEquals(info['reported_bytes_used'], 1123)
 
         sleep(.00001)
-        broker.delete_object('o2', normalize_timestamp(time()))
+        broker.delete_object('o2', normalize_timestamp(time()), 0)
         info = broker.get_info()
         self.assertEquals(info['object_count'], 0)
         self.assertEquals(info['bytes_used'], 0)
@@ -1070,6 +1120,19 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEquals([(row[0], row[5]) for row in listing],
                           [('a', 0), ('b', 1), ('c', 2)])
 
+    def test_list_misplaced_objects(self):
+        broker = ContainerBroker(':memory:', account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), 0)
+        broker.put_object('a', normalize_timestamp(100), 0,
+                          'text/plain', 'd41d8cd98f00b204e9800998ecf8427e', 0)
+        broker.put_object('b', normalize_timestamp(101), 0,
+                          'text/plain', 'd41d8cd98f00b204e9800998ecf8427e', 1)
+        broker.put_object('c', normalize_timestamp(101), 0,
+                          'text/plain', 'd41d8cd98f00b204e9800998ecf8427e', 2)
+        listing = broker.list_misplaced_objects(25)
+        self.assertEquals(len(listing), 2)
+        self.assertEquals([(row[0], row[5]) for row in listing],
+                          [('b', 1), ('c', 2)])
 
     def test_chexor(self):
         broker = ContainerBroker(':memory:', account='a', container='c')
@@ -1256,8 +1319,8 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEqual(2, info['misplaced_object_count'])
 
         # deleted objects don't count
-        broker.delete_object('b1', normalize_timestamp(time()))
-        broker.delete_object('b2', normalize_timestamp(time()))
+        broker.delete_object('b1', normalize_timestamp(time()), 0)
+        broker.delete_object('b2', normalize_timestamp(time()), 0)
         broker.set_storage_policy_index(111)
         info = broker.get_info()
         self.assertEqual(1, info['misplaced_object_count'])
@@ -1305,13 +1368,13 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEqual(2, broker.get_info()['misplaced_object_count'])
 
         # deleting a misplaced object drops the count back down
-        broker.delete_object('jkl2', normalize_timestamp(time()))
+        broker.delete_object('jkl2', normalize_timestamp(time()), 1234)
         self.assertEqual(1, broker.get_info()['misplaced_object_count'])
-        broker.delete_object('jkl1', normalize_timestamp(time()))
+        broker.delete_object('jkl1', normalize_timestamp(time()), 1234)
         self.assertEqual(0, broker.get_info()['misplaced_object_count'])
 
         # deleting an object we didn't know about doesn't affect the count
-        broker.delete_object('nonesuch', normalize_timestamp(time()))
+        broker.delete_object('nonesuch', normalize_timestamp(time()), 0)
         self.assertEqual(0, broker.get_info()['misplaced_object_count'])
 
 

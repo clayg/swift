@@ -14,8 +14,10 @@
 # limitations under the License.
 
 import cPickle as pickle
+import mock
 import os
 import unittest
+from collections import defaultdict
 from contextlib import closing
 from gzip import GzipFile
 from shutil import rmtree
@@ -23,11 +25,12 @@ from tempfile import mkdtemp
 
 from eventlet import spawn, Timeout, listen
 
-from swift.common import utils
+from swift.common import internal_client, swob, utils
 from swift.container import updater as container_updater
 from swift.container.backend import ContainerBroker, DATADIR
 from swift.common.ring import RingData
-from swift.common.utils import normalize_timestamp
+from swift.common.utils import normalize_timestamp, split_path
+from test.unit.common.middleware.helpers import FakeSwift
 
 
 class TestContainerUpdater(unittest.TestCase):
@@ -214,6 +217,60 @@ class TestContainerUpdater(unittest.TestCase):
         self.assertEquals(info['bytes_used'], 3)
         self.assertEquals(info['reported_object_count'], 1)
         self.assertEquals(info['reported_bytes_used'], 3)
+
+
+class FakeStoragePolicySwift(object):
+    """
+    Acts like a FakeSwift, but internally has one FakeSwift per storage policy
+    and routes things accordingly.
+    """
+    def __init__(self):
+        self.storage_policy = defaultdict(FakeSwift)
+        self._mock_oldest_spi_map = {}
+
+    def __getattribute__(self, name):
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return getattr(self.storage_policy[None], name)
+
+    def __call__(self, env, start_response):
+        method = env['REQUEST_METHOD']
+        path = env['PATH_INFO']
+        _, acc, cont, obj = split_path(env['PATH_INFO'], 0, 4,
+                                       rest_with_last=True)
+        if not obj:
+            spidx = None
+        else:
+            spidx = int(env.get('HTTP_X_BACKEND_STORAGE_POLICY_INDEX',
+                                self._mock_oldest_spi_map.get(cont, 0)))
+
+        try:
+            return self.storage_policy[spidx].__call__(
+                env, start_response)
+        except KeyError:
+            pass
+
+        if method == 'PUT':
+            resp_class = swob.HTTPCreated
+        else:
+            resp_class = swob.HTTPNotFound
+        self.storage_policy[spidx].register(
+            method, path, resp_class, {}, '')
+
+        return self.storage_policy[spidx].__call__(
+            env, start_response)
+
+
+class FakeInternalClient(internal_client.InternalClient):
+    def __init__(self, listings):
+        self.app = FakeStoragePolicySwift()
+        self.user_agent = 'fake-internal-client'
+        self.request_tries = 1
+
+
+class TestContainerReconciler(unittest.TestCase):
+    pass
 
 
 if __name__ == '__main__':

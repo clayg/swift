@@ -482,11 +482,19 @@ class Replicator(Daemon):
             self.stats['success' if success else 'failure'] += 1
             self.logger.increment('successes' if success else 'failures')
             responses.append(success)
-        if not shouldbehere and all(responses):
-            # If the db shouldn't be on this node and has been successfully
-            # synced to all of its peers, it can be removed.
+        if self.should_delete_db(broker, responses, shouldbehere):
             self.delete_db(object_file)
         self.logger.timing_since('timing', start_time)
+
+    def should_delete_db(self, broker, responses, shouldbehere):
+        """
+        Returns whether or not to keep this DB on this system after replicating
+        it to all (other) primary nodes.
+
+        If the db shouldn't be on this node and has been successfully synced
+        to all of its peers, it can be removed.
+        """
+        return not shouldbehere and all(responses)
 
     def delete_db(self, object_file):
         hash_dir = os.path.dirname(object_file)
