@@ -310,7 +310,8 @@ class ContainerController(object):
                 return HTTPNotFound()
             broker.put_object(obj, timestamp, int(req.headers['x-size']),
                               req.headers['x-content-type'],
-                              req.headers['x-etag'])
+                              req.headers['x-etag'],
+                              requested_policy_index)
             return HTTPCreated(request=req)
         else:   # put container
             created = self._update_or_create(req, broker, timestamp,

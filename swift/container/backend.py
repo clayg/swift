@@ -31,6 +31,26 @@ from swift.common.db import DatabaseBroker, DatabaseConnectionError, \
 DATADIR = 'containers'
 
 
+SPI_TRIGGER_SCRIPT = """
+    CREATE TRIGGER object_insert_spi AFTER INSERT ON object
+    BEGIN
+        UPDATE container_stat
+        SET misplaced_object_count = misplaced_object_count +
+            (new.storage_policy_index <> storage_policy_index) *
+            (1 - new.deleted);
+    END;
+
+    CREATE TRIGGER object_delete_spi AFTER DELETE ON object
+    BEGIN
+        UPDATE container_stat
+        SET misplaced_object_count = misplaced_object_count -
+            (old.storage_policy_index <> storage_policy_index) *
+            (1 - old.deleted);
+    END;
+
+"""
+
+
 class ContainerBroker(DatabaseBroker):
     """Encapsulates working with a container database."""
     db_type = 'container'
@@ -73,7 +93,8 @@ class ContainerBroker(DatabaseBroker):
                 size INTEGER,
                 content_type TEXT,
                 etag TEXT,
-                deleted INTEGER DEFAULT 0
+                deleted INTEGER DEFAULT 0,
+                storage_policy_index INTEGER
             );
 
             CREATE INDEX ix_object_deleted_name ON object (deleted, name);
@@ -98,7 +119,9 @@ class ContainerBroker(DatabaseBroker):
                     bytes_used = bytes_used - old.size,
                     hash = chexor(hash, old.name, old.created_at);
             END;
-        """)
+
+            %s
+        """ % SPI_TRIGGER_SCRIPT)
 
     def create_container_stat_table(self, conn, put_timestamp,
                                     storage_policy_index):
@@ -132,7 +155,8 @@ class ContainerBroker(DatabaseBroker):
                 metadata TEXT DEFAULT '',
                 x_container_sync_point1 INTEGER DEFAULT -1,
                 x_container_sync_point2 INTEGER DEFAULT -1,
-                storage_policy_index INTEGER
+                storage_policy_index INTEGER,
+                misplaced_object_count INTEGER DEFAULT 0
             );
 
             INSERT INTO container_stat (object_count, bytes_used)
@@ -176,14 +200,23 @@ class ContainerBroker(DatabaseBroker):
 
     def _commit_puts_load(self, item_list, entry):
         """See :func:`swift.common.db.DatabaseBroker._commit_puts_load`"""
-        (name, timestamp, size, content_type, etag, deleted) = \
-            pickle.loads(entry.decode('base64'))
+        loaded = pickle.loads(entry.decode('base64'))
+        if len(loaded) == 6:
+            (name, timestamp, size, content_type, etag, deleted) = loaded
+            # If this doesn't have the policy index in there, then it was
+            # written out by a container broker that predates storage
+            # policies. Thus, on upgrade, we treat it as policy 0.
+            storage_policy_index = 0
+        else:
+            (name, timestamp, size, content_type, etag,
+             deleted, storage_policy_index) = loaded
         item_list.append({'name': name,
                           'created_at': timestamp,
                           'size': size,
                           'content_type': content_type,
                           'etag': etag,
-                          'deleted': deleted})
+                          'deleted': deleted,
+                          'storage_policy_index': storage_policy_index})
 
     def empty(self):
         """
@@ -204,9 +237,11 @@ class ContainerBroker(DatabaseBroker):
         :param name: object name to be deleted
         :param timestamp: timestamp when the object was marked as deleted
         """
-        self.put_object(name, timestamp, 0, 'application/deleted', 'noetag', 1)
+        self.put_object(name, timestamp, 0, 'application/deleted', 'noetag',
+                        -1, 1)
 
-    def put_object(self, name, timestamp, size, content_type, etag, deleted=0):
+    def put_object(self, name, timestamp, size, content_type, etag,
+                   storage_policy_index, deleted=0):
         """
         Creates an object in the DB with its metadata.
 
@@ -216,11 +251,12 @@ class ContainerBroker(DatabaseBroker):
         :param content_type: object content-type
         :param etag: object etag
         :param deleted: if True, marks the object as deleted and sets the
-                        deteleted_at timestamp to timestamp
+                        deleted_at timestamp to timestamp
         """
         record = {'name': name, 'created_at': timestamp, 'size': size,
                   'content_type': content_type, 'etag': etag,
-                  'deleted': deleted}
+                  'deleted': deleted,
+                  'storage_policy_index': storage_policy_index}
         if self.db_file == ':memory:':
             self.merge_items([record])
             return
@@ -242,7 +278,8 @@ class ContainerBroker(DatabaseBroker):
                     # delimiter
                     fp.write(':')
                     fp.write(pickle.dumps(
-                        (name, timestamp, size, content_type, etag, deleted),
+                        (name, timestamp, size, content_type, etag, deleted,
+                         storage_policy_index),
                         protocol=PICKLE_PROTOCOL).encode('base64'))
                     fp.flush()
 
@@ -276,14 +313,15 @@ class ContainerBroker(DatabaseBroker):
                   put_timestamp, delete_timestamp, object_count, bytes_used,
                   reported_put_timestamp, reported_delete_timestamp,
                   reported_object_count, reported_bytes_used, hash, id,
-                  x_container_sync_point1, x_container_sync_point2, and
-                  storage_policy_index.
+                  x_container_sync_point1, x_container_sync_point2,
+                  misplaced_object_count, and storage_policy_index.
         """
         self._commit_puts_stale_ok()
         with self.get() as conn:
             data = None
             trailing_sync = 'x_container_sync_point1, x_container_sync_point2'
             trailing_pol = 'storage_policy_index'
+            trailing_moc = 'misplaced_object_count'
             while not data:
                 try:
                     data = conn.execute('''
@@ -291,15 +329,19 @@ class ContainerBroker(DatabaseBroker):
                             delete_timestamp, object_count, bytes_used,
                             reported_put_timestamp, reported_delete_timestamp,
                             reported_object_count, reported_bytes_used, hash,
-                            id, %s, %s
+                            id, %s, %s, %s
                         FROM container_stat
-                    ''' % (trailing_sync, trailing_pol)).fetchone()
+                    ''' % (trailing_sync, trailing_pol,
+                           trailing_moc)).fetchone()
                 except sqlite3.OperationalError as err:
-                    if 'no such column: x_container_sync_point' in str(err):
+                    errstr = str(err)
+                    if 'no such column: x_container_sync_point' in errstr:
                         trailing_sync = '-1 AS x_container_sync_point1, ' \
                                         '-1 AS x_container_sync_point2'
-                    elif 'no such column: storage_policy_index' in str(err):
+                    elif 'no such column: storage_policy_index' in errstr:
                         trailing_pol = '0 AS storage_policy_index'
+                    elif 'no such column: misplaced_object_count' in errstr:
+                        trailing_moc = '0 AS misplaced_object_count'
                     else:
                         raise
             data = dict(data)
@@ -358,8 +400,13 @@ class ContainerBroker(DatabaseBroker):
         def _setit(conn):
             conn.execute("""
                 UPDATE container_stat
-                SET storage_policy_index = ?
-            """, (policy_index,))
+                SET storage_policy_index = ?,
+                    misplaced_object_count = (
+                        SELECT count(*)
+                        FROM object
+                        WHERE object.storage_policy_index <> ?
+                        AND object.deleted = 0)
+            """, (policy_index, policy_index))
             conn.commit()
 
         with self.get() as conn:
@@ -499,10 +546,11 @@ class ContainerBroker(DatabaseBroker):
         Merge items into the object table.
 
         :param item_list: list of dictionaries of {'name', 'created_at',
-                          'size', 'content_type', 'etag', 'deleted'}
+                          'size', 'content_type', 'etag', 'deleted',
+                          'storage_policy_index'}
         :param source: if defined, update incoming_sync with the source
         """
-        with self.get() as conn:
+        def _really_merge_items(conn):
             max_rowid = -1
             for rec in item_list:
                 query = '''
@@ -518,10 +566,11 @@ class ContainerBroker(DatabaseBroker):
                 if not conn.execute(query, (rec['name'],)).fetchall():
                     conn.execute('''
                         INSERT INTO object (name, created_at, size,
-                            content_type, etag, deleted)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                            content_type, etag, storage_policy_index, deleted)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                     ''', ([rec['name'], rec['created_at'], rec['size'],
-                          rec['content_type'], rec['etag'], rec['deleted']]))
+                           rec['content_type'], rec['etag'],
+                           rec['storage_policy_index'], rec['deleted']]))
                 if source:
                     max_rowid = max(max_rowid, rec['ROWID'])
             if source:
@@ -537,13 +586,34 @@ class ContainerBroker(DatabaseBroker):
                     ''', (max_rowid, source))
             conn.commit()
 
+        with self.get() as conn:
+            try:
+                _really_merge_items(conn)
+            except sqlite3.OperationalError as err:
+                if 'has no column named storage_policy_index' not in str(err):
+                    raise
+                self._migrate_add_storage_policy_index(conn)
+                _really_merge_items(conn)
+
     def _migrate_add_storage_policy_index(self, conn):
         """
-        Add the storage_policy_index column to the 'container_stat' table.
+        Add the storage_policy_index column to the 'objects' and
+        'container_stat' tables and set up triggers.
         """
         conn.executescript('''
+            ALTER TABLE object
+            ADD COLUMN storage_policy_index INTEGER;
+
+            UPDATE object SET storage_policy_index=0;
+
             ALTER TABLE container_stat
             ADD COLUMN storage_policy_index INTEGER;
 
-            UPDATE container_stat SET storage_policy_index=0;
-        ''')
+            ALTER TABLE container_stat
+            ADD COLUMN misplaced_object_count INTEGER;
+
+            UPDATE container_stat SET storage_policy_index=0,
+                                      misplaced_object_count=0;
+
+            %s
+        ''' % SPI_TRIGGER_SCRIPT)
