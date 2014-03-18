@@ -104,7 +104,7 @@ class StoragePolicyCollection(object):
         Validates semantics of policies read in from conf file.
         - if no pol 0 or no policies defined, pol 0 is declared
         - policy index must be integer
-        - if no policy is decalred default, pol 0 is the default
+        - if no policy is declared default, pol 0 is the default
         - policy indexes must be unique
         - policy names are required
         - policy names must be unique

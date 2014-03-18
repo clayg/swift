@@ -24,10 +24,11 @@ import random
 from swift.common import db_replicator
 from swift.container import replicator, backend, server
 from swift.common.utils import normalize_timestamp
+from swift.common.exceptions import StoragePolicyConflict
 from swift.common.storage_policy import POLICIES
 
 from test.unit.common import test_db_replicator
-from test.unit import patch_policies
+from test.unit import patch_policies, mocked_http_conn
 
 
 class TestReplicator(unittest.TestCase):
@@ -103,7 +104,8 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         remote_broker.initialize(time.time(), POLICIES.default.idx)
         timestamp = time.time()
         for db in (broker, remote_broker):
-            db.put_object('/a/c/o', timestamp, 0, 'content-type', 'etag')
+            db.put_object('/a/c/o', timestamp, 0, 'content-type', 'etag',
+                          policy_index=db.storage_policy_index)
         # replicate
         daemon = replicator.ContainerReplicator({})
         part, node = self._get_broker_part_node(remote_broker)
@@ -174,7 +176,8 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         remote_broker = self._get_broker('a', 'c', node_index=1)
         remote_broker.initialize(put_timestamp, POLICIES.default.idx)
         # add a row to "local" db
-        broker.put_object('/a/c/o', time.time(), 0, 'content-type', 'etag')
+        broker.put_object('/a/c/o', time.time(), 0, 'content-type', 'etag',
+                          policy_index=broker.storage_policy_index)
         #replicate
         node = {'device': 'sdc', 'replication_ip': '127.0.0.1'}
         daemon = replicator.ContainerReplicator({})
@@ -215,10 +218,12 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
             put_timestamp = time.time()
             for db in (broker, remote_broker):
                 path = '/a/c/o_%s' % i
-                db.put_object(path, put_timestamp, 0, 'content-type', 'etag')
+                db.put_object(path, put_timestamp, 0, 'content-type', 'etag',
+                              policy_index=db.storage_policy_index)
         # now a row to the "local" broker only
         broker.put_object('/a/c/o_missing', time.time(), 0,
-                          'content-type', 'etag')
+                          'content-type', 'etag',
+                          policy_index=broker.storage_policy_index)
         # replicate
         daemon = replicator.ContainerReplicator({})
         part, node = self._get_broker_part_node(remote_broker)
@@ -252,7 +257,8 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
             for db in (broker, remote_broker):
                 obj_name = 'o_%s' % i
                 db.put_object(obj_name, put_timestamp, 0,
-                              'content-type', 'etag')
+                              'content-type', 'etag',
+                              policy_index=db.storage_policy_index)
         # setup REPLICATE callback to simulate adding rows during merge_items
         missing_counter = itertools.count()
 
@@ -261,7 +267,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
                 return
             path = '/a/c/o_missing_%s' % missing_counter.next()
             broker.put_object(path, time.time(), 0, 'content-type',
-                              'etag')
+                              'etag', policy_index=db.storage_policy_index)
         test_db_replicator.FakeReplConnection = \
             test_db_replicator.attach_fake_replication_rpc(
                 self.rpc, replicate_hook=put_more_objects)
@@ -356,7 +362,8 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
             dbs = variations[scenario_name]
             obj_ts = ts.next()
             for db in dbs:
-                db.put_object('/a/c/o', obj_ts, 0, 'content-type', 'etag')
+                db.put_object('/a/c/o', obj_ts, 0, 'content-type', 'etag',
+                              policy_index=db.storage_policy_index)
             # replicate
             part, node = self._get_broker_part_node(broker)
             daemon = self._run_once(node)
@@ -633,6 +640,117 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
             remote_recreate_timestamp = ts.next()
             remote_broker.update_put_timestamp(remote_recreate_timestamp)
             remote_broker.update_status_changed_at(remote_recreate_timestamp)
+
+    @patch_policies
+    def test_out_of_sync_storage_policy_merge_cleans_up_pending(self):
+        ts = itertools.count(int(time.time()))
+        policy = random.choice(POLICIES)
+        remote_policy = random.choice(
+            [p for p in POLICIES if p is not policy])
+        broker = self._get_broker('a', 'c', node_index=0)
+        remote_broker = self._get_broker('a', 'c', node_index=1)
+        # create "local" broker
+        broker.initialize(ts.next(), policy.idx)
+        broker.put_object('/a/c/o', ts.next(), 0, 'content-type', 'etag',
+                          policy_index=broker.storage_policy_index)
+        orig_pending_file = broker.pending_file
+        self.assertTrue(os.path.exists(orig_pending_file))
+        # create "remote" broker
+        remote_broker.initialize(ts.next(), remote_policy.idx)
+        remote_broker.put_object(
+            '/a/c/o', ts.next(), 0, 'content-type', 'etag',
+            policy_index=remote_broker.storage_policy_index)
+        orig_remote_pending_file = remote_broker.pending_file
+        self.assertTrue(os.path.exists(orig_remote_pending_file))
+
+        # replicate
+        part, node = self._get_broker_part_node(broker)
+        daemon = self._run_once(node)
+
+        def _rsync_file(db_file, remote_file, **kwargs):
+            remote_server, remote_path = remote_file.split('/', 1)
+            dest_path = os.path.join(self.root, remote_path)
+            shutil.copy(db_file, dest_path)
+            return True
+        daemon._rsync_file = _rsync_file
+        info = broker.get_replication_info()
+        with mocked_http_conn(500):
+            success = daemon._repl_to_node(node, broker, part, info)
+        self.assertTrue(success)
+
+        # in sync
+        broker = self._get_broker(
+            'a', 'c', node_index=0)
+        local_info = broker.get_info()
+        remote_broker = self._get_broker(
+            'a', 'c', node_index=1)
+        remote_info = remote_broker.get_info()
+        expected = policy.idx
+        self.assertEqual(local_info['storage_policy_index'], expected)
+        self.assertEqual(remote_info['storage_policy_index'],
+                         local_info['storage_policy_index'])
+
+        self.assertTrue(os.path.exists(orig_pending_file))
+        self.assertFalse(os.path.exists(orig_remote_pending_file))
+
+        self.assertEqual(remote_broker.storage_policy_index, policy.idx)
+        self.assertRaises(StoragePolicyConflict, remote_broker.put_object,
+                          '/a/c/o', ts.next(), 0, 'content-type', 'etag',
+                          policy_index=remote_policy.idx)
+        remote_broker.put_object(
+            '/a/c/o', ts.next(), 0, 'content-type', 'etag',
+            policy_index=policy.idx)
+
+    @patch_policies
+    def test_out_of_sync_remote_storage_policy_merge_cleans_up_pending(self):
+        ts = itertools.count(int(time.time()))
+        policy = random.choice(POLICIES)
+        remote_policy = random.choice(
+            [p for p in POLICIES if p is not policy])
+        broker = self._get_broker('a', 'c', node_index=0)
+        remote_broker = self._get_broker('a', 'c', node_index=1)
+        # create "remote" broker
+        remote_broker.initialize(ts.next(), remote_policy.idx)
+        remote_broker.put_object(
+            'o', ts.next(), 0, 'content-type', 'etag',
+            policy_index=remote_broker.storage_policy_index)
+        orig_remote_pending_file = remote_broker.pending_file
+        self.assertTrue(os.path.exists(orig_remote_pending_file))
+        # create "local" broker
+        broker.initialize(ts.next(), policy.idx)
+        broker.put_object('o1', ts.next(), 0, 'content-type', 'etag',
+                          policy_index=broker.storage_policy_index)
+        broker.put_object('o2', ts.next(), 0, 'content-type', 'etag',
+                          policy_index=broker.storage_policy_index)
+        orig_pending_file = broker.pending_file
+        self.assertTrue(os.path.exists(orig_pending_file))
+
+        # replicate
+        part, node = self._get_broker_part_node(broker)
+        daemon = self._run_once(node)
+
+        self.assertEqual(daemon.stats['success'], 2)
+
+        # in sync
+        broker = self._get_broker('a', 'c', node_index=0)
+        local_info = broker.get_info()
+        remote_broker = self._get_broker('a', 'c', node_index=1)
+        remote_info = remote_broker.get_info()
+        expected = remote_policy.idx
+        self.assertEqual(local_info['storage_policy_index'], expected)
+        self.assertEqual(remote_info['storage_policy_index'],
+                         local_info['storage_policy_index'])
+
+        self.assertTrue(os.path.exists(orig_remote_pending_file))
+        self.assertEqual(os.path.getsize(orig_remote_pending_file), 0)
+        self.assertFalse(os.path.exists(orig_pending_file))
+
+        self.assertRaises(StoragePolicyConflict, broker.put_object,
+                          '/a/c/o', ts.next(), 0, 'content-type', 'etag',
+                          policy_index=policy.idx)
+        broker.put_object(
+            '/a/c/o', ts.next(), 0, 'content-type', 'etag',
+            policy_index=remote_policy.idx)
 
 
 if __name__ == '__main__':

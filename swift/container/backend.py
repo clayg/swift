@@ -24,7 +24,9 @@ import errno
 
 import sqlite3
 
+from swift.common.exceptions import StoragePolicyConflict
 from swift.common.utils import normalize_timestamp, lock_parent_directory
+from swift.common.storage_policy import get_policy_string
 from swift.common.db import DatabaseBroker, DatabaseConnectionError, \
     PENDING_CAP, PICKLE_PROTOCOL, utf8encode
 
@@ -40,9 +42,14 @@ class ContainerBroker(DatabaseBroker):
     @property
     def storage_policy_index(self):
         if not hasattr(self, '_storage_policy_index'):
-            self._storage_policy_index = \
-                self.get_info()['storage_policy_index']
+            self._storage_policy_index = self.get_info(
+                force_stale_reads=True)['storage_policy_index']
         return self._storage_policy_index
+
+    def _get_pending_file(self, policy_index=None):
+        if policy_index is None:
+            policy_index = self.storage_policy_index
+        return get_policy_string(self._pending_file, policy_index)
 
     def _initialize(self, conn, put_timestamp, storage_policy_index):
         """
@@ -205,16 +212,22 @@ class ContainerBroker(DatabaseBroker):
                 'SELECT object_count from container_stat').fetchone()
             return (row[0] == 0)
 
-    def delete_object(self, name, timestamp):
+    def delete_object(self, name, timestamp, policy_index=0):
         """
         Mark an object deleted.
 
         :param name: object name to be deleted
         :param timestamp: timestamp when the object was marked as deleted
-        """
-        self.put_object(name, timestamp, 0, 'application/deleted', 'noetag', 1)
+        :param policy_idx: the policy index
 
-    def put_object(self, name, timestamp, size, content_type, etag, deleted=0):
+        :raises: StoragePolicyConflict if storage policy index for the object
+                 update does not match the policy index for the container
+        """
+        self.put_object(name, timestamp, 0, 'application/deleted',
+                        'noetag', 1, policy_index)
+
+    def put_object(self, name, timestamp, size, content_type, etag, deleted=0,
+                   policy_index=0):
         """
         Creates an object in the DB with its metadata.
 
@@ -225,6 +238,10 @@ class ContainerBroker(DatabaseBroker):
         :param etag: object etag
         :param deleted: if True, marks the object as deleted and sets the
                         deteleted_at timestamp to timestamp
+        :param policy_index: the storage policy index
+
+        :raises: StoragePolicyConflict if storage policy index for the object
+                 update does not match the policy index for the container
         """
         record = {'name': name, 'created_at': timestamp, 'size': size,
                   'content_type': content_type, 'etag': etag,
@@ -235,17 +252,25 @@ class ContainerBroker(DatabaseBroker):
         if not os.path.exists(self.db_file):
             raise DatabaseConnectionError(self.db_file, "DB doesn't exist")
         pending_size = 0
+        pending_file = self._get_pending_file(policy_index)
         try:
-            pending_size = os.path.getsize(self.pending_file)
+            pending_size = os.path.getsize(pending_file)
         except OSError as err:
-            if err.errno != errno.ENOENT:
+            if err.errno == errno.ENOENT:
+                # for file not found, make sure its not because of a policy
+                # index mismatch...
+                if pending_file != self.pending_file:
+                    raise StoragePolicyConflict(
+                        'Invalid Storage Policy Index %d for "%s"' % (
+                            policy_index, name))
+            else:
                 raise
         if pending_size > PENDING_CAP:
             self._commit_puts([record])
         else:
-            with lock_parent_directory(self.pending_file,
+            with lock_parent_directory(pending_file,
                                        self.pending_timeout):
-                with open(self.pending_file, 'a+b') as fp:
+                with open(pending_file, 'a+b') as fp:
                     # Colons aren't used in base64 encoding; so they are our
                     # delimiter
                     fp.write(':')
@@ -283,7 +308,7 @@ class ContainerBroker(DatabaseBroker):
             (float(info['delete_timestamp']) > float(info['put_timestamp']))
         return info, is_deleted
 
-    def get_info(self):
+    def get_info(self, force_stale_reads=False):
         """
         Get global data for the container.
 
@@ -294,7 +319,8 @@ class ContainerBroker(DatabaseBroker):
                   reported_bytes_used, hash, id, x_container_sync_point1,
                   x_container_sync_point2, and storage_policy_index.
         """
-        self._commit_puts_stale_ok()
+        if not force_stale_reads:
+            self._commit_puts_stale_ok()
         with self.get() as conn:
             data = None
             trailing_sync = 'x_container_sync_point1, x_container_sync_point2'
@@ -370,6 +396,8 @@ class ContainerBroker(DatabaseBroker):
             ''', (sync_point2,))
 
     def set_storage_policy_index(self, policy_index, timestamp=0):
+        old_pending_file_name = self.pending_file
+
         # XXX tests
         def _setit(conn):
             conn.execute("""
@@ -389,6 +417,11 @@ class ContainerBroker(DatabaseBroker):
                 _setit(conn)
 
         self._storage_policy_index = policy_index
+        try:
+            os.rename(old_pending_file_name, self.pending_file)
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                raise
 
     def reported(self, put_timestamp, delete_timestamp, object_count,
                  bytes_used):

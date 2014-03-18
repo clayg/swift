@@ -33,7 +33,6 @@ from swift.common.utils import json, normalize_timestamp, renamer, \
     mkdirs, lock_parent_directory, fallocate
 from swift.common.exceptions import LockTimeout
 
-
 #: Whether calls will be made to preallocate disk space for database files.
 DB_PREALLOCATION = True
 #: Timeout for trying to connect to a DB
@@ -197,7 +196,7 @@ class DatabaseBroker(object):
         """Encapsulates working with a database."""
         self.conn = None
         self.db_file = db_file
-        self.pending_file = self.db_file + '.pending'
+        self._pending_file = self.db_file + '.pending'
         self.pending_timeout = pending_timeout or 10
         self.stale_reads_ok = stale_reads_ok
         self.db_dir = os.path.dirname(db_file)
@@ -214,6 +213,13 @@ class DatabaseBroker(object):
         This is vital for useful diagnostics.
         """
         return self.db_file
+
+    @property
+    def pending_file(self):
+        return self._get_pending_file()
+
+    def _get_pending_file(self, **kwargs):
+        return self._pending_file
 
     def initialize(self, put_timestamp=None, *_initialize_args):
         """
@@ -550,17 +556,18 @@ class DatabaseBroker(object):
 
         :param item_list: A list of items to commit in addition to .pending
         """
-        if self.db_file == ':memory:' or not os.path.exists(self.pending_file):
+        pending_file = self.pending_file
+        if self.db_file == ':memory:' or not os.path.exists(pending_file):
             return
         if item_list is None:
             item_list = []
-        with lock_parent_directory(self.pending_file, self.pending_timeout):
+        with lock_parent_directory(pending_file, self.pending_timeout):
             self._preallocate()
-            if not os.path.getsize(self.pending_file):
+            if not os.path.getsize(pending_file):
                 if item_list:
                     self.merge_items(item_list)
                 return
-            with open(self.pending_file, 'r+b') as fp:
+            with open(pending_file, 'r+b') as fp:
                 for entry in fp.read().split(':'):
                     if entry:
                         try:
@@ -568,7 +575,7 @@ class DatabaseBroker(object):
                         except Exception:
                             self.logger.exception(
                                 _('Invalid pending entry %(file)s: %(entry)s'),
-                                {'file': self.pending_file, 'entry': entry})
+                                {'file': pending_file, 'entry': entry})
                 if item_list:
                     self.merge_items(item_list)
                 try:

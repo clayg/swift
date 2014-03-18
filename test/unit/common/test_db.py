@@ -175,6 +175,11 @@ class TestDatabaseBroker(unittest.TestCase):
         self.assertEqual(broker.db_file, db_file)
         self.assert_(broker.conn is None)
 
+    def test_pending_file(self):
+        db_file = os.path.join(self.testdir, '1.db')
+        broker = DatabaseBroker(db_file)
+        self.assertEqual(broker.pending_file, db_file + '.pending')
+
     def test_disk_preallocate(self):
         test_size = [-1]
 

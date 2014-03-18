@@ -36,7 +36,7 @@ from swift.common.utils import get_logger, hash_path, public, \
 from swift.common.constraints import check_mount, check_float, check_utf8
 from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
-from swift.common.exceptions import ConnectionTimeout
+from swift.common.exceptions import ConnectionTimeout, StoragePolicyConflict
 from swift.common.http import HTTP_NOT_FOUND, is_success
 from swift.common.storage_policy import POLICIES, POLICY_INDEX
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPConflict, \
@@ -241,22 +241,28 @@ class ContainerController(object):
                                   content_type='text/plain')
         if self.mount_check and not check_mount(self.root, drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
+        # policy index is only relevant for delete_obj (and possibly
+        # autocreate container)
+        obj_policy_index = self.get_and_validate_policy_index(req) or 0
         broker = self._get_container_broker(drive, part, account, container)
         if account.startswith(self.auto_create_account_prefix) and obj and \
                 not os.path.exists(broker.db_file):
-            requested_policy_index = (self.get_and_validate_policy_index(req)
-                                      or POLICIES.default.idx)
             try:
                 broker.initialize(
                     normalize_timestamp(
                         req.headers.get('x-timestamp') or time.time()),
-                    requested_policy_index)
+                    obj_policy_index)
             except DatabaseAlreadyExists:
                 pass
         if not os.path.exists(broker.db_file):
             return HTTPNotFound()
         if obj:     # delete object
-            broker.delete_object(obj, req.headers.get('x-timestamp'))
+            try:
+                broker.delete_object(obj, req.headers.get('x-timestamp'),
+                                     obj_policy_index)
+            except StoragePolicyConflict as e:
+                return HTTPConflict(str(e), request=req,
+                                    content_type='text/plain')
             return HTTPNoContent(request=req)
         else:
             # delete container
@@ -313,26 +319,35 @@ class ContainerController(object):
         if self.mount_check and not check_mount(self.root, drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         requested_policy_index = self.get_and_validate_policy_index(req)
-        if requested_policy_index is None:
-            new_container_policy = POLICIES.default.idx
-        else:
-            new_container_policy = requested_policy_index
         timestamp = normalize_timestamp(req.headers['x-timestamp'])
         broker = self._get_container_broker(drive, part, account, container)
         if obj:     # put container object
+            # obj put requires existing policy_index, default is for legacy
+            # support during upgrade.
+            obj_policy_index = requested_policy_index or 0
             if account.startswith(self.auto_create_account_prefix) and \
                     not os.path.exists(broker.db_file):
                 try:
-                    broker.initialize(timestamp, new_container_policy)
+                    broker.initialize(timestamp, obj_policy_index)
                 except DatabaseAlreadyExists:
                     pass
             if not os.path.exists(broker.db_file):
                 return HTTPNotFound()
-            broker.put_object(obj, timestamp, int(req.headers['x-size']),
-                              req.headers['x-content-type'],
-                              req.headers['x-etag'])
+            try:
+                broker.put_object(obj, timestamp,
+                                  int(req.headers['x-size']),
+                                  req.headers['x-content-type'],
+                                  req.headers['x-etag'], 0,
+                                  obj_policy_index)
+            except StoragePolicyConflict as e:
+                return HTTPConflict(str(e), request=req,
+                                    content_type='text/plain')
             return HTTPCreated(request=req)
         else:   # put container
+            if requested_policy_index is None:
+                new_container_policy = POLICIES.default.idx
+            else:
+                new_container_policy = requested_policy_index
             created = self._update_or_create(req, broker, timestamp,
                                              new_container_policy)
             if requested_policy_index is not None and not created:

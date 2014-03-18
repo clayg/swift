@@ -20,10 +20,14 @@ import unittest
 from time import sleep, time
 from uuid import uuid4
 import itertools
+from tempfile import mkdtemp
+import os
+from shutil import rmtree
 
 from swift.container.backend import ContainerBroker
+from swift.common.exceptions import StoragePolicyConflict
 from swift.common.utils import normalize_timestamp
-from swift.common.storage_policy import POLICIES
+from swift.common.storage_policy import POLICIES, StoragePolicy
 
 import mock
 
@@ -1138,6 +1142,8 @@ class TestContainerBroker(unittest.TestCase):
                 self.assertEquals(rec['created_at'], normalize_timestamp(5))
                 self.assertEquals(rec['content_type'], 'text/plain')
 
+    @patch_policies([StoragePolicy(0, 'zero', True),
+                    StoragePolicy(1, 'one', False)])
     def test_set_storage_policy_index(self):
         broker = ContainerBroker(':memory:', account='test_account',
                                  container='test_container')
@@ -1146,20 +1152,17 @@ class TestContainerBroker(unittest.TestCase):
         info = broker.get_info()
         self.assertEqual(0, info['storage_policy_index'])  # sanity check
 
-        broker.set_storage_policy_index(111)
-        self.assertEqual(broker.storage_policy_index, 111)
+        broker.set_storage_policy_index(1)
         info = broker.get_info()
-        self.assertEqual(111, info['storage_policy_index'])
+        self.assertEqual(1, info['storage_policy_index'])
 
-        broker.set_storage_policy_index(222)
-        self.assertEqual(broker.storage_policy_index, 222)
+        broker.set_storage_policy_index(1)  # it's idempotent
         info = broker.get_info()
-        self.assertEqual(222, info['storage_policy_index'])
+        self.assertEqual(1, info['storage_policy_index'])
 
-        broker.set_storage_policy_index(222)  # it's idempotent
-        info = broker.get_info()
-        self.assertEqual(222, info['storage_policy_index'])
-
+    @patch_policies([StoragePolicy(0, 'zero', True),
+                    StoragePolicy(1, 'one', False),
+                    StoragePolicy(2, 'two', False)])
     def test_set_storage_policy_index_empty(self):
         # Putting an object may trigger migrations, so test with a
         # never-had-an-object container to make sure we handle it
@@ -1172,6 +1175,78 @@ class TestContainerBroker(unittest.TestCase):
         broker.set_storage_policy_index(2)
         info = broker.get_info()
         self.assertEqual(2, info['storage_policy_index'])
+
+
+class TestOnDiskContainerBroker(unittest.TestCase):
+
+    def setUp(self):
+        self.testdir = mkdtemp()
+        self.db_path = os.path.join(self.testdir, 'test.db')
+
+    def tearDown(self):
+        rmtree(self.testdir, ignore_errors=1)
+
+    def test_default_storage_policy_index(self):
+        broker = ContainerBroker(self.db_path, account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), POLICIES.default.idx)
+        policy_index = broker.storage_policy_index
+        self.assertEqual(policy_index, POLICIES.default.idx)
+        pending_file = self.db_path + '.pending'
+        if POLICIES.default.idx != 0:
+            pending_file += '-%d' % POLICIES.default.idx
+        self.assertEqual(pending_file, broker.pending_file)
+
+    @patch_policies([StoragePolicy(0, 'zero', True),
+                     StoragePolicy(1, 'one', False)])
+    def test_non_default_storage_policy_index(self):
+        broker = ContainerBroker(self.db_path, account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), 1)
+        self.assertEqual(broker.storage_policy_index, 1)
+        pending_file = self.db_path + '.pending-1'
+        self.assertEqual(pending_file, broker.pending_file)
+
+    def test_put_object_pending(self):
+        broker = ContainerBroker(self.db_path, account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), POLICIES.default.idx)
+        broker.put_object('o', normalize_timestamp(time()), 0, 'text/plain',
+                          'd41d8cd98f00b204e9800998ecf8427e',
+                          policy_index=POLICIES.default.idx)
+        self.assertTrue(os.path.exists(broker.pending_file))
+        self.assertTrue(os.path.getsize(broker.pending_file))
+        info = broker.get_info()
+        self.assertEqual(info['storage_policy_index'], POLICIES.default.idx)
+        # file is truncated
+        self.assertEqual(0, os.path.getsize(broker.pending_file))
+
+        broker = ContainerBroker(self.db_path)
+        # instance spi cache is empty
+        self.assertFalse(hasattr(broker, '_storage_policy_index'))
+        self.assertTrue(os.path.exists(broker.pending_file))
+        # instance cache is populated
+        self.assertEqual(broker._storage_policy_index, POLICIES.default.idx)
+
+    @patch_policies([StoragePolicy(0, 'zero', True),
+                     StoragePolicy(1, 'one', False)])
+    def test_non_default_put_object_pending(self):
+        broker = ContainerBroker(self.db_path, account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), 1)
+        self.assertRaises(StoragePolicyConflict, broker.put_object, 'o',
+                          normalize_timestamp(time()), 0, 'text/plain',
+                          'd41d8cd98f00b204e9800998ecf8427e', policy_index=0)
+        broker.put_object('o', normalize_timestamp(time()), 0, 'text/plain',
+                          'd41d8cd98f00b204e9800998ecf8427e', policy_index=1)
+        self.assertTrue(os.path.exists(broker.pending_file))
+        info = broker.get_info()
+        self.assertEqual(info['storage_policy_index'], 1)
+        # file is truncated
+        self.assertEqual(0, os.path.getsize(broker.pending_file))
+
+        broker = ContainerBroker(self.db_path)
+        # instance spi cache is empty
+        self.assertFalse(hasattr(broker, '_storage_policy_index'))
+        self.assertTrue(os.path.exists(broker.pending_file))
+        # instance cache is populated
+        self.assertEqual(broker._storage_policy_index, 1)
 
 
 def premetadata_create_container_stat_table(self, conn, put_timestamp,

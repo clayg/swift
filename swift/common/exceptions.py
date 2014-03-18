@@ -69,6 +69,10 @@ class DiskFileDeviceUnavailable(DiskFileError):
     pass
 
 
+class StoragePolicyConflict(ValueError):
+    pass
+
+
 class PathNotDir(OSError):
     pass
 

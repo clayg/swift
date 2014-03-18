@@ -214,8 +214,8 @@ class Application(object):
             max_account_name_length=constraints.MAX_ACCOUNT_NAME_LENGTH,
             max_container_name_length=constraints.MAX_CONTAINER_NAME_LENGTH,
             max_object_name_length=constraints.MAX_OBJECT_NAME_LENGTH,
-            policies=POLICIES.get_policy_info(),
-            strict_cors_mode=self.strict_cors_mode)
+            strict_cors_mode=self.strict_cors_mode,
+            policies=POLICIES.get_policy_info())
 
     def check_config(self):
         """
