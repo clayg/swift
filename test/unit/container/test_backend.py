@@ -1056,6 +1056,21 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEquals(len(listing), 2)
         self.assertEquals([row[0] for row in listing], ['b:a', 'b:b'])
 
+    def test_list_objects_iter_includes_policy(self):
+        broker = ContainerBroker(':memory:', account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), 0)
+        broker.put_object('a', normalize_timestamp(100), 0,
+                          'text/plain', 'd41d8cd98f00b204e9800998ecf8427e', 0)
+        broker.put_object('b', normalize_timestamp(101), 0,
+                          'text/plain', 'd41d8cd98f00b204e9800998ecf8427e', 1)
+        broker.put_object('c', normalize_timestamp(101), 0,
+                          'text/plain', 'd41d8cd98f00b204e9800998ecf8427e', 2)
+        listing = broker.list_objects_iter(25, None, None, None, None)
+        self.assertEquals(len(listing), 3)
+        self.assertEquals([(row[0], row[5]) for row in listing],
+                          [('a', 0), ('b', 1), ('c', 2)])
+
+
     def test_chexor(self):
         broker = ContainerBroker(':memory:', account='a', container='c')
         broker.initialize(normalize_timestamp('1'), 0)

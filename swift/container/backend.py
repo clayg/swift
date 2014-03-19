@@ -454,7 +454,7 @@ class ContainerBroker(DatabaseBroker):
                      the path
 
         :returns: list of tuples of (name, created_at, size, content_type,
-                  etag)
+                  etag, storage_policy_index)
         """
         delim_force_gte = False
         (marker, end_marker, prefix, delimiter, path) = utf8encode(
@@ -471,7 +471,8 @@ class ContainerBroker(DatabaseBroker):
         with self.get() as conn:
             results = []
             while len(results) < limit:
-                query = '''SELECT name, created_at, size, content_type, etag
+                query = '''SELECT name, created_at, size, content_type, etag,
+                                  storage_policy_index
                            FROM object WHERE'''
                 query_args = []
                 if end_marker:

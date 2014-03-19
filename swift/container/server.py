@@ -439,8 +439,9 @@ class ContainerController(object):
                 resp_headers[key] = value
         ret = Response(request=req, headers=resp_headers,
                        content_type=out_content_type, charset='utf-8')
-        container_list = broker.list_objects_iter(limit, marker, end_marker,
-                                                  prefix, delimiter, path)
+        container_list = [rec[:5] for rec in
+                          broker.list_objects_iter(limit, marker, end_marker,
+                                                   prefix, delimiter, path)]
         if out_content_type == 'application/json':
             ret.body = json.dumps([self.update_data_record(record)
                                    for record in container_list])
