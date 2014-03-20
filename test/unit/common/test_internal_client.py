@@ -798,7 +798,7 @@ class TestInternalClient(unittest.TestCase):
                 self.make_request_called += 1
                 self.test.assertEquals('DELETE', method)
                 self.test.assertEquals(self.path, path)
-                self.test.assertEquals({}, headers)
+                self.test.assertEquals(headers['X-My-Header'], 'soup')
                 self.test.assertEquals((2, 404), acceptable_statuses)
                 self.test.assertEquals(None, body_file)
 
@@ -806,7 +806,8 @@ class TestInternalClient(unittest.TestCase):
         path = make_path(account, container, obj)
 
         client = InternalClient(self, path)
-        client.delete_object(account, container, obj)
+        client.delete_object(account, container, obj,
+                             headers={'X-My-Header': 'soup'})
         self.assertEquals(1, client.make_request_called)
 
     def test_get_object_metadata(self):

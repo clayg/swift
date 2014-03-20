@@ -486,34 +486,61 @@ class DatabaseBroker(object):
                 result.append({'remote_id': row[0], 'sync_point': row[1]})
             return result
 
-    def get_replication_info(self):
+    def get_replication_info(self, missing_column_defaults=None):
         """
         Get information about the DB required for replication.
 
+        :param missing_column_defaults: values for missing columns in the
+            _stat table. The keys are the column names and the values are
+            what gets added into this function's returned dictionary.
+
         :returns: dict containing keys: hash, id, created_at, put_timestamp,
-            delete_timestamp, count, max_row, and metadata
+            delete_timestamp, count, max_row, and metadata, plus whatever
+            was specified in missing_column_defaults.
         """
         self._commit_puts_stale_ok()
-        query_part1 = '''
+        query_base1 = '''
             SELECT hash, id, created_at, put_timestamp, delete_timestamp,
                 %s_count AS count,
                 CASE WHEN SQLITE_SEQUENCE.seq IS NOT NULL
-                    THEN SQLITE_SEQUENCE.seq ELSE -1 END AS max_row, ''' % \
-            self.db_contains_type
-        query_part2 = '''
+                     THEN SQLITE_SEQUENCE.seq ELSE -1 END AS max_row
+        ''' % self.db_contains_type
+        query_base2 = '''
             FROM (%s_stat LEFT JOIN SQLITE_SEQUENCE
                   ON SQLITE_SEQUENCE.name == '%s') LIMIT 1
         ''' % (self.db_type, self.db_contains_type)
+
+        query_base = query_base1 + " %(cols)s " + query_base2
+
+        # If these columns are missing from the _stat table, the default
+        # values will be used instead.
+        if missing_column_defaults is None:
+            missing_column_defaults = {}
+        missing_column_defaults['metadata'] = ""
+        data_to_add = {}
+
         with self.get() as conn:
-            try:
-                curs = conn.execute(query_part1 + 'metadata' + query_part2)
-            except sqlite3.OperationalError as err:
-                if 'no such column: metadata' not in str(err):
-                    raise
-                curs = conn.execute(query_part1 + "'' as metadata" +
-                                    query_part2)
-            curs.row_factory = dict_factory
-            return curs.fetchone()
+            while True:
+                cols = ''.join(', %s' % c for c in missing_column_defaults)
+                query = query_base % {'cols': cols}
+                try:
+                    curs = conn.execute(query)
+                except sqlite3.OperationalError as err:
+                    str_err = str(err)
+                    found_one = False
+                    for column in missing_column_defaults:
+                        if ('no such column: %s' % column) in str_err:
+                            found_one = True
+                            data_to_add[column] = \
+                                missing_column_defaults.pop(column)
+                            break
+                    if not found_one:
+                        raise
+                else:
+                    curs.row_factory = dict_factory
+                    result = curs.fetchone()
+                    result.update(data_to_add)
+                    return result
 
     def _commit_puts(self, item_list=None):
         """

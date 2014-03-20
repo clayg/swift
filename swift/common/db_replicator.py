@@ -368,13 +368,14 @@ class Replicator(Daemon):
                 _('ERROR Unable to connect to remote server: %s'), node)
             return False
         with Timeout(self.node_timeout):
-            response = http.replicate(
-                'sync', info['max_row'], info['hash'], info['id'],
-                info['created_at'], info['put_timestamp'],
-                info['delete_timestamp'], info['metadata'])
+            sync_args = self.sync_args_from_replication_info(info)
+            response = http.replicate('sync', *sync_args)
         if not response:
             return False
-        elif response.status == HTTP_NOT_FOUND:  # completely missing, rsync
+        return self._handle_sync_response(node, response, info, broker, http)
+
+    def _handle_sync_response(self, node, response, info, broker, http):
+        if response.status == HTTP_NOT_FOUND:  # completely missing, rsync
             self.stats['rsync'] += 1
             self.logger.increment('rsyncs')
             return self._rsync_db(broker, node, http, info['id'])
@@ -511,6 +512,11 @@ class Replicator(Daemon):
         device_name = self.extract_device(object_file)
         self.logger.increment('removes.' + device_name)
 
+    def sync_args_from_replication_info(self, info):
+        return [info['max_row'], info['hash'], info['id'],
+                info['created_at'], info['put_timestamp'],
+                info['delete_timestamp'], info['metadata']]
+
     def extract_device(self, object_file):
         """
         Extract the device name from an object path.  Returns "UNKNOWN" if the
@@ -607,7 +613,7 @@ class ReplicatorRpc(object):
 
     def sync(self, broker, args):
         (remote_sync, hash_, id_, created_at, put_timestamp,
-         delete_timestamp, metadata) = args
+         delete_timestamp, metadata) = args[:7]
         timemark = time.time()
         try:
             info = broker.get_replication_info()

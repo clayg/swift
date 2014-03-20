@@ -45,6 +45,33 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPConflict, \
     HTTPInsufficientStorage, HTTPException, HeaderKeyDict
 
 
+class ContainerReplicatorRpc(ReplicatorRpc):
+    """
+    Handle the container-specific parts of REPLICATE calls
+    """
+
+    def sync(self, broker, args):
+        remote_created_at = args[3]
+        try:
+            remote_storage_policy_index = int(args[7])
+        except IndexError:
+            # pre-storage-policy code sends a 7-tuple, but we can treat it as
+            # though they sent policy 0
+            remote_storage_policy_index = 0
+
+        my_info = broker.get_info()
+        my_storage_policy_index = my_info['storage_policy_index']
+        my_created_at = my_info['created_at']
+        # The oldest policy index wins. In the event of a timestamp tie,
+        # the numerically-lesser storage policy wins.
+        if ((my_storage_policy_index != remote_storage_policy_index) and
+            ((my_created_at > remote_created_at) or
+             (my_created_at == remote_created_at and
+              my_storage_policy_index > remote_storage_policy_index))):
+            broker.set_storage_policy_index(remote_storage_policy_index)
+        return super(ContainerReplicatorRpc, self).sync(broker, args)
+
+
 class ContainerController(object):
     """WSGI Controller for the container server."""
 
@@ -75,7 +102,7 @@ class ContainerController(object):
             h.strip()
             for h in conf.get('allowed_sync_hosts', '127.0.0.1').split(',')
             if h.strip()]
-        self.replicator_rpc = ReplicatorRpc(
+        self.replicator_rpc = ContainerReplicatorRpc(
             self.root, DATADIR, ContainerBroker, self.mount_check,
             logger=self.logger)
         self.auto_create_account_prefix = \

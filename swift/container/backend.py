@@ -47,7 +47,6 @@ SPI_TRIGGER_SCRIPT = """
             (old.storage_policy_index <> storage_policy_index) *
             (1 - old.deleted);
     END;
-
 """
 
 
@@ -77,6 +76,7 @@ class ContainerBroker(DatabaseBroker):
         self.create_object_table(conn)
         self.create_container_stat_table(conn, put_timestamp,
                                          storage_policy_index)
+        self.create_object_cleanup_table(conn)
 
     def create_object_table(self, conn):
         """
@@ -156,7 +156,8 @@ class ContainerBroker(DatabaseBroker):
                 x_container_sync_point1 INTEGER DEFAULT -1,
                 x_container_sync_point2 INTEGER DEFAULT -1,
                 storage_policy_index INTEGER,
-                misplaced_object_count INTEGER DEFAULT 0
+                misplaced_object_count INTEGER DEFAULT 0,
+                object_cleanup_count INTEGER DEFAULT 0
             );
 
             INSERT INTO container_stat (object_count, bytes_used)
@@ -168,6 +169,32 @@ class ContainerBroker(DatabaseBroker):
                 put_timestamp = ?, storage_policy_index = ?
         ''', (self.account, self.container, normalize_timestamp(time.time()),
               str(uuid4()), put_timestamp, storage_policy_index))
+
+    def create_object_cleanup_table(self, conn):
+        """
+        Create the object_cleanup table
+        """
+        conn.executescript("""
+            CREATE TABLE object_cleanup (
+                ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                created_at TEXT,
+                storage_policy_index INTEGER);
+
+            CREATE INDEX ix_object_cleanup_name ON object_cleanup (name);
+
+            CREATE TRIGGER object_cleanup_insert AFTER INSERT ON object_cleanup
+            BEGIN
+                UPDATE container_stat
+                SET object_cleanup_count = object_cleanup_count + 1;
+            END;
+
+            CREATE TRIGGER object_cleanup_delete AFTER DELETE ON object_cleanup
+            BEGIN
+                UPDATE container_stat
+                SET object_cleanup_count = object_cleanup_count - 1;
+            END;
+        """)
 
     def get_db_version(self, conn):
         if self._db_version == -1:
@@ -316,7 +343,8 @@ class ContainerBroker(DatabaseBroker):
                   reported_put_timestamp, reported_delete_timestamp,
                   reported_object_count, reported_bytes_used, hash, id,
                   x_container_sync_point1, x_container_sync_point2,
-                  misplaced_object_count, and storage_policy_index.
+                  misplaced_object_count, object_cleanup_count,
+                  and storage_policy_index.
         """
         self._commit_puts_stale_ok()
         with self.get() as conn:
@@ -324,6 +352,7 @@ class ContainerBroker(DatabaseBroker):
             trailing_sync = 'x_container_sync_point1, x_container_sync_point2'
             trailing_pol = 'storage_policy_index'
             trailing_moc = 'misplaced_object_count'
+            trailing_occ = 'object_cleanup_count'
             while not data:
                 try:
                     data = conn.execute('''
@@ -331,10 +360,10 @@ class ContainerBroker(DatabaseBroker):
                             delete_timestamp, object_count, bytes_used,
                             reported_put_timestamp, reported_delete_timestamp,
                             reported_object_count, reported_bytes_used, hash,
-                            id, %s, %s, %s
+                            id, %s, %s, %s, %s
                         FROM container_stat
                     ''' % (trailing_sync, trailing_pol,
-                           trailing_moc)).fetchone()
+                           trailing_moc, trailing_occ)).fetchone()
                 except sqlite3.OperationalError as err:
                     errstr = str(err)
                     if 'no such column: x_container_sync_point' in errstr:
@@ -344,12 +373,25 @@ class ContainerBroker(DatabaseBroker):
                         trailing_pol = '0 AS storage_policy_index'
                     elif 'no such column: misplaced_object_count' in errstr:
                         trailing_moc = '0 AS misplaced_object_count'
+                    elif 'no such column: object_cleanup_count' in errstr:
+                        trailing_occ = '0 AS object_cleanup_count'
                     else:
                         raise
             data = dict(data)
             # populate instance cache
             self._storage_policy_index = data['storage_policy_index']
             return data
+
+    def get_replication_info(self, missing_column_defaults=None):
+        """
+        Get information about the DB required for replication.
+
+        Does what the superclass does, but adds in a default of
+        storage_policy_index=0 to the result.
+        """
+        super_dfl = dict(missing_column_defaults or {})
+        super_dfl.setdefault('storage_policy_index', 0)
+        return super(ContainerBroker, self).get_replication_info(super_dfl)
 
     def set_x_container_sync_points(self, sync_point1, sync_point2):
         with self.get() as conn:
@@ -417,7 +459,7 @@ class ContainerBroker(DatabaseBroker):
             except sqlite3.OperationalError as err:
                 if "no such column: storage_policy_index" not in str(err):
                     raise
-                self._migrate_add_storage_policy_index(conn)
+                self._migrate_add_storage_policy_stuff(conn)
                 _setit(conn)
 
         self._storage_policy_index = policy_index
@@ -566,13 +608,13 @@ class ContainerBroker(DatabaseBroker):
                     break
             return results
 
-    # XXX test meeeee
-    def list_misplaced_objects(self, limit):
+    def list_misplaced_objects(self, limit, marker=''):
         """
         Get a list of objects sorted by name which are in a storage policy
         different from the container's storage policy.
 
         :param limit: maximum number of entries to get
+        :param marker: marker query
 
         :returns: list of tuples of (name, created_at, size, content_type,
                   etag, storage_policy_index)
@@ -580,12 +622,14 @@ class ContainerBroker(DatabaseBroker):
         query = '''
             SELECT name, created_at, size, content_type, etag,
                    storage_policy_index
-            FROM object WHERE storage_policy_index != (
+            FROM object
+            WHERE storage_policy_index != (
                 SELECT storage_policy_index FROM container_stat LIMIT 1)
+            AND name > ?
             LIMIT ?
         '''
         with self.get() as conn:
-            return conn.execute(query, (limit,)).fetchall()
+            return list(conn.execute(query, (marker, limit)).fetchall())
 
     def merge_items(self, item_list, source=None):
         """
@@ -683,7 +727,7 @@ class ContainerBroker(DatabaseBroker):
             except sqlite3.OperationalError as err:
                 if 'no such column: storage_policy_index' not in str(err):
                     raise
-                self._migrate_add_storage_policy_index(conn)
+                self._migrate_add_storage_policy_stuff(conn)
                 _really_merge_items(conn)
 
     def delete_cleanup(self, cleanup):
@@ -696,10 +740,14 @@ class ContainerBroker(DatabaseBroker):
             DELETE FROM object_cleanup
             WHERE name = ? AND created_at = ? AND storage_policy_index = ?
         """
-        with self.get() as conn:
-            conn.execute(query, (cleanup['name'], cleanup['created_at'],
-                                 cleanup['storage_policy_index']))
-            conn.commit()
+        try:
+            with self.get() as conn:
+                conn.execute(query, (cleanup['name'], cleanup['created_at'],
+                                     cleanup['storage_policy_index']))
+                conn.commit()
+        except sqlite3.OperationalError as err:
+            if "no such table: object_cleanup" not in str(err):
+                raise
 
     def _insert_object_cleanup_row(self, conn, name, created_at,
                                    storage_policy_index):
@@ -722,16 +770,10 @@ class ContainerBroker(DatabaseBroker):
             if "no such table: object_cleanup" not in str(err):
                 print str(err)
                 raise
-            conn.execute('''
-                CREATE TABLE object_cleanup (
-                    ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT,
-                    created_at TEXT,
-                    storage_policy_index INTEGER)
-            ''')
+            self.create_object_cleanup_table(conn)
             conn.execute(query, (name, created_at, storage_policy_index))
 
-    def _migrate_add_storage_policy_index(self, conn):
+    def _migrate_add_storage_policy_stuff(self, conn):
         """
         Add the storage_policy_index column to the 'objects' and
         'container_stat' tables and set up triggers.
@@ -748,8 +790,12 @@ class ContainerBroker(DatabaseBroker):
             ALTER TABLE container_stat
             ADD COLUMN misplaced_object_count INTEGER;
 
+            ALTER TABLE container_stat
+            ADD COLUMN object_cleanup_count INTEGER;
+
             UPDATE container_stat SET storage_policy_index=0,
-                                      misplaced_object_count=0;
+                                      misplaced_object_count=0,
+                                      object_cleanup_count=0;
 
             %s
         ''' % SPI_TRIGGER_SCRIPT)

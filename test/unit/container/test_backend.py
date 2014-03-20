@@ -1123,16 +1123,26 @@ class TestContainerBroker(unittest.TestCase):
     def test_list_misplaced_objects(self):
         broker = ContainerBroker(':memory:', account='a', container='c')
         broker.initialize(normalize_timestamp('1'), 0)
-        broker.put_object('a', normalize_timestamp(100), 0,
+        broker.put_object('aaa', normalize_timestamp(100), 0,
                           'text/plain', 'd41d8cd98f00b204e9800998ecf8427e', 0)
-        broker.put_object('b', normalize_timestamp(101), 0,
+        broker.put_object('aac', normalize_timestamp(101), 0,
                           'text/plain', 'd41d8cd98f00b204e9800998ecf8427e', 1)
-        broker.put_object('c', normalize_timestamp(101), 0,
+        broker.put_object('aae', normalize_timestamp(101), 0,
                           'text/plain', 'd41d8cd98f00b204e9800998ecf8427e', 2)
         listing = broker.list_misplaced_objects(25)
         self.assertEquals(len(listing), 2)
         self.assertEquals([(row[0], row[5]) for row in listing],
-                          [('b', 1), ('c', 2)])
+                          [('aac', 1), ('aae', 2)])
+
+        listing = broker.list_misplaced_objects(25, marker='aab')
+        self.assertEquals(len(listing), 2)
+        self.assertEquals([(row[0], row[5]) for row in listing],
+                          [('aac', 1), ('aae', 2)])
+
+        listing = broker.list_misplaced_objects(25, marker='aac')
+        self.assertEquals(len(listing), 1)
+        self.assertEquals([(row[0], row[5]) for row in listing],
+                          [('aae', 2)])
 
     def test_chexor(self):
         broker = ContainerBroker(':memory:', account='a', container='c')
@@ -1376,6 +1386,16 @@ class TestContainerBroker(unittest.TestCase):
         # deleting an object we didn't know about doesn't affect the count
         broker.delete_object('nonesuch', normalize_timestamp(time()), 0)
         self.assertEqual(0, broker.get_info()['misplaced_object_count'])
+
+    def test_storage_policy_index_in_replication_info(self):
+        broker = ContainerBroker(':memory:', account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), 0)
+        self.assertEqual(
+            0, broker.get_replication_info().get('storage_policy_index'))
+
+        broker.set_storage_policy_index(4931)
+        self.assertEqual(
+            4931, broker.get_replication_info().get('storage_policy_index'))
 
 
 def prespi_create_object_table(self, conn):

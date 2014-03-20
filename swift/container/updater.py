@@ -54,7 +54,6 @@ def slightly_later_timestamp(ts):
     return float(ts) + 0.00001
 
 
-# XXX tests for this function
 def direct_get_oldest_storage_policy_index(container_ring, account_name,
                                            container_name):
     """
@@ -105,6 +104,7 @@ class ContainerReconciler(object):
 
     def get_swift(self):
         if not self.swift:
+            # XXX untested branch
             self.swift = InternalClient(
                 self.conf_path, 'Swift Container Reconciler',
                 self.request_tries)
@@ -113,6 +113,7 @@ class ContainerReconciler(object):
     def get_container_ring(self):
         """Get the container ring.  Load it if it hasn't been yet."""
         if not self.container_ring:
+            # XXX untested branch
             self.container_ring = Ring(self.swift_dir, ring_name='container')
         return self.container_ring
 
@@ -120,13 +121,12 @@ class ContainerReconciler(object):
         # XXX throw out some statsd stats
 
         # XXX make sure there's not active work going on for this container,
-        # and shove shit into a greenthread
+        # and shove shit into a greenthread, but do it after the fast check
+        # here:
 
-        # XXX tests
-
-        if info['misplaced_object_count'] <= 0:
+        if (info['misplaced_object_count'] <= 0 and
+                info['object_cleanup_count'] <= 0):
             return
-
         # If two different container DBs disagree about their policy index, we
         # could get reconciler fights: one daemon moves an object A -> B, then
         # the other back from B -> A, and so on. This is clearly wasteful, so
@@ -136,7 +136,7 @@ class ContainerReconciler(object):
         # This means that no reconcilation will happen for a given container
         # unless a quorum of its primary servers are up.
         real_spi = direct_get_oldest_storage_policy_index(
-            self.container_ring, broker.account, broker.container)
+            self.get_container_ring(), broker.account, broker.container)
         if info['storage_policy_index'] != real_spi:
             return
 
@@ -170,13 +170,14 @@ class ContainerReconciler(object):
                 #
                 # If we nudged both the tombstones and new object to T + 10μs,
                 # then there'd be a race between the two container updates.
-                self.reconcile_object(
+                copied = self.reconcile_object(
                     broker.account, broker.container, obj,
                     created_at, policy_index, info['storage_policy_index'])
-                self.throw_tombstones(
-                    broker.account, broker.container, obj,
-                    slightly_later_timestamp(created_at),
-                    policy_index)
+                if copied:
+                    self.throw_tombstones(
+                        broker.account, broker.container, obj,
+                        slightly_later_timestamp(created_at),
+                        policy_index)
                 # If we're running on a primary replica, then it's possible
                 # that the synchronous container updates have caused a cleanup
                 # row to be created for this object, but we just cleaned it
@@ -186,16 +187,16 @@ class ContainerReconciler(object):
                 broker.delete_cleanup({'name': obj, 'created_at': created_at,
                                        'storage_policy_index': policy_index})
             misplaced = broker.list_misplaced_objects(
-                MISPLACED_OBJECT_BATCH_SIZE)
+                MISPLACED_OBJECT_BATCH_SIZE,
+                misplaced[-1]['name'])
 
-    # XXX basically everything in here is totally untested
     def reconcile_object(self, account, container, obj, obj_listing_ts,
                          from_policy_index, to_policy_index):
         if from_policy_index == to_policy_index:
-            return
+            return False
         # Check if object is still available (it could have been deleted by
         # the user or another reconciler).
-        get_headers = {'X-Override-Storage-Policy-Index': from_policy_index}
+        get_headers = {'X-Backend-Storage-Policy-Index': from_policy_index}
         try:
             real_obj_status, real_obj_info, real_obj_iter = \
                 self.get_swift().get_object(account, container, obj,
@@ -204,31 +205,33 @@ class ContainerReconciler(object):
             # Object is unavailable for some reason; give up and we'll try
             # again later. If the object was actually deleted, then the delete
             # will propagate to the container listng and we won't try again.
-            return
+            return False
 
         obj_listing_ts = normalize_timestamp(obj_listing_ts)
         real_ts = normalize_timestamp(real_obj_info.get("X-Timestamp"))
         if obj_listing_ts != real_ts:
             # This isn't the object we're looking for. Give up and try again
             # later.
-            return
+            return False
 
         # Copy the object to the proper storage policy.
-        put_ts = slightly_later_timestamp(slightly_later_timestamp(
-            obj_listing_ts))
-        put_headers = {'X-Override-Storage-Policy-Index': to_policy_index,
+        put_ts = normalize_timestamp(
+            slightly_later_timestamp(
+                slightly_later_timestamp(obj_listing_ts)))
+        put_headers = {'X-Backend-Storage-Policy-Index': to_policy_index,
                        'X-Timestamp': put_ts}
         self.get_swift().upload_object(
             FileLikeIter(real_obj_iter), account, container, obj,
             put_headers)
+        return True
 
     def throw_tombstones(self, account, container, obj, timestamp,
                          storage_policy_index):
         self.logger.debug('deleting "%s" (%s) from storage policy %s',
                           '%s/%s/%s' % (account, container, obj), timestamp,
                           storage_policy_index)
-        headers = {'X-Timestamp': slightly_later_timestamp(timestamp),
-                   'X-Override-Storage-Policy-Index': storage_policy_index}
+        headers = {'X-Timestamp': normalize_timestamp(timestamp),
+                   'X-Backend-Storage-Policy-Index': storage_policy_index}
         self.get_swift().delete_object(account, container, obj,
                                        headers=headers,
                                        acceptable_statuses=(2, 4))
@@ -409,7 +412,7 @@ class ContainerUpdater(Daemon):
         info = broker.get_info()
 
         self.send_update_to_account(broker, info)
-        self.reconcile_misplaced_objects(broker, info)
+        self.reconcile_container(broker, info)
 
     def send_update_to_account(self, broker, info):
         """
@@ -512,7 +515,7 @@ class ContainerUpdater(Daemon):
             finally:
                 conn.close()
 
-    def reconcile_misplaced_objects(self, broker, info):
+    def reconcile_container(self, broker, info):
         """
         Move misplaced objects to the proper storage policies.
 

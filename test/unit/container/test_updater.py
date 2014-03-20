@@ -16,6 +16,7 @@
 import cPickle as pickle
 import mock
 import os
+import time
 import unittest
 from collections import defaultdict
 from contextlib import closing
@@ -28,8 +29,10 @@ from eventlet import spawn, Timeout, listen
 from swift.common import internal_client, swob, utils
 from swift.container import updater as container_updater
 from swift.container.backend import ContainerBroker, DATADIR
+from swift.common.exceptions import ClientException
 from swift.common.ring import RingData
 from swift.common.utils import normalize_timestamp, split_path
+from test.unit import FakeLogger, FakeRing
 from test.unit.common.middleware.helpers import FakeSwift
 
 
@@ -263,14 +266,306 @@ class FakeStoragePolicySwift(object):
 
 
 class FakeInternalClient(internal_client.InternalClient):
-    def __init__(self, listings):
+    def __init__(self):
         self.app = FakeStoragePolicySwift()
         self.user_agent = 'fake-internal-client'
         self.request_tries = 1
 
 
 class TestContainerReconciler(unittest.TestCase):
-    pass
+    def setUp(self):
+        self.testdir = mkdtemp()
+
+        self.container_policy = 633
+        self.broker = ContainerBroker(
+            os.path.join(self.testdir, 'test_reconciler'),
+            account='a', container='c')
+        self.broker.initialize(normalize_timestamp(time.time()),
+                               self.container_policy)
+
+        self.reconciler = container_updater.ContainerReconciler({
+            'request_tries': 1}, FakeLogger())
+        self.reconciler.container_ring = FakeRing()
+        self.reconciler.swift = FakeInternalClient()
+        self.fake_swift = self.reconciler.swift.app
+
+    def tearDown(self):
+        rmtree(self.testdir)
+
+    def reconcile(self, oldest_policy_index=False, check_calls=True):
+        if oldest_policy_index is False:
+            # Match by default, but allow someone to pass in None because None
+            # indicates failure
+            oldest_policy_index = self.container_policy
+
+        with mock.patch.object(
+                container_updater,
+                'direct_get_oldest_storage_policy_index') as mock_get_oldest:
+            mock_get_oldest.return_value = oldest_policy_index
+            self.reconciler.reconcile_container(
+                self.broker, self.broker.get_info())
+
+        # we actually called mock_get_oldest correctly
+        if check_calls:
+            calls = mock_get_oldest.mock_calls
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                calls[0],
+                mock.call(self.reconciler.container_ring,
+                          self.broker.account, self.broker.container))
+
+    def test_happy_path(self):
+        now = 1395725943.92440
+
+        # this one's in the right place, so it'll be skipped
+        self.broker.put_object(
+            'abc', normalize_timestamp(now), 0, 'text/plain',
+            'etag-abc', self.container_policy)
+        self.broker.put_object(
+            'def', normalize_timestamp(now), 0, 'text/plain',
+            'etag-def', self.container_policy + 1)
+
+        self.fake_swift.storage_policy[self.container_policy + 1].register(
+            'GET', '/v1/a/c/def', swob.HTTPOk,
+            {'X-Timestamp': normalize_timestamp(now)},
+            "vowelish-superworldly")
+        self.fake_swift.storage_policy[self.container_policy + 1].register(
+            'DELETE', '/v1/a/c/def', swob.HTTPNoContent, {}, None)
+        self.fake_swift.storage_policy[self.container_policy].register(
+            'PUT', '/v1/a/c/def', swob.HTTPCreated, {}, None)
+        self.reconcile()
+
+        # we didn't forget the policy override anywhere
+        self.assertEqual(self.fake_swift.storage_policy[None].calls, [])
+
+        source = self.fake_swift.storage_policy[self.container_policy + 1]
+        destination = self.fake_swift.storage_policy[self.container_policy]
+        self.assertEqual(
+            source.calls,
+            [('GET', '/v1/a/c/def'), ('DELETE', '/v1/a/c/def')])
+        self.assertEqual(
+            destination.calls,
+            [('PUT', '/v1/a/c/def')])
+
+        self.assertEqual(source.headers[1]['X-Timestamp'], "1395725943.92441")
+        self.assertEqual(destination.headers[0]['X-Timestamp'],
+                         "1395725943.92442")
+
+        # make sure we got the body contents right
+        _, _, resp_body = self.reconciler.swift.get_object(
+            'a', 'c', 'def',
+            {'X-Backend-Storage-Policy-Index': self.container_policy})
+        self.assertEqual(''.join(resp_body), "vowelish-superworldly")
+
+    def test_early_deletion_of_cleanups(self):
+        pass
+
+    def test_source_object_404(self):
+        pass
+
+    def test_storage_polices_dont_actually_differ(self):
+        # This is just a bit of defensive programming to protect against
+        # future changes; there's currently no way (without mocking) to
+        # trigger this condition, so we have to introduce an error the hard
+        # way.
+        now = 1395729638.46292
+
+        def fake_list_misplaced_objects(marker=''):
+            if not marker:
+                return [('obj', normalize_timestamp(now),
+                         'junk', 'junk', 'junk', self.container_policy)]
+            else:
+                return []
+
+        with mock.patch.object(self.broker, 'list_misplaced_objects',
+                               fake_list_misplaced_objects):
+            self.reconcile(check_calls=False)
+
+        source = self.fake_swift.storage_policy[self.container_policy + 1]
+        destination = self.fake_swift.storage_policy[self.container_policy]
+        self.assertEqual(source.calls, [])
+        self.assertEqual(destination.calls, [])
+
+    def test_source_timestamp_older(self):
+        now = 1395726350.73870
+        self.broker.put_object(
+            'obj', normalize_timestamp(now - 0.001), 374202518, 'text/plain',
+            'd0ed3614637ae52456607488b796db9f', self.container_policy + 1)
+        self.fake_swift.storage_policy[self.container_policy + 1].register(
+            'GET', '/v1/a/c/obj', swob.HTTPOk,
+            {'X-Timestamp': normalize_timestamp(now)},
+            "stuffstuff")
+        self.reconcile()
+
+        # we didn't forget the policy override anywhere
+        self.assertEqual(self.fake_swift.storage_policy[None].calls, [])
+
+        source = self.fake_swift.storage_policy[self.container_policy + 1]
+        destination = self.fake_swift.storage_policy[self.container_policy]
+        self.assertEqual(source.calls, [('GET', '/v1/a/c/obj')])
+        self.assertEqual(destination.calls, [])
+
+    def test_source_timestamp_newer(self):
+        now = 1395728503.06582
+        self.broker.put_object(
+            'obj', normalize_timestamp(now + 0.001), 374202518, 'text/plain',
+            'd0ed3614637ae52456607488b796db9f', self.container_policy + 1)
+        self.fake_swift.storage_policy[self.container_policy + 1].register(
+            'GET', '/v1/a/c/obj', swob.HTTPOk,
+            {'X-Timestamp': normalize_timestamp(now)},
+            "stuffstuff")
+        self.reconcile()
+
+        # we didn't forget the policy override anywhere
+        self.assertEqual(self.fake_swift.storage_policy[None].calls, [])
+
+        source = self.fake_swift.storage_policy[self.container_policy + 1]
+        destination = self.fake_swift.storage_policy[self.container_policy]
+        self.assertEqual(source.calls, [('GET', '/v1/a/c/obj')])
+        self.assertEqual(destination.calls, [])
+
+    def test_real_policy_index_differs(self):
+        now = 1395726350.73870
+        self.broker.put_object(
+            'obj', normalize_timestamp(now - 0.001), 374202518, 'text/plain',
+            'd0ed3614637ae52456607488b796db9f', self.container_policy + 1)
+        self.fake_swift.storage_policy[self.container_policy + 1].register(
+            'GET', '/v1/a/c/obj', swob.HTTPOk,
+            {'X-Timestamp': normalize_timestamp(now)},
+            "stuffstuff")
+        self.reconcile(oldest_policy_index=self.container_policy + 99)
+
+        source = self.fake_swift.storage_policy[self.container_policy + 1]
+        destination = self.fake_swift.storage_policy[self.container_policy]
+        self.assertEqual(source.calls, [])
+        self.assertEqual(destination.calls, [])
+
+    def test_real_policy_index_unknown(self):
+        now = 1395726350.73870
+        self.broker.put_object(
+            'obj', normalize_timestamp(now - 0.001), 374202518, 'text/plain',
+            'd0ed3614637ae52456607488b796db9f', self.container_policy + 1)
+        self.fake_swift.storage_policy[self.container_policy + 1].register(
+            'GET', '/v1/a/c/obj', swob.HTTPOk,
+            {'X-Timestamp': normalize_timestamp(now)},
+            "stuffstuff")
+        # None means "couldn't get quorum"
+        self.reconcile(oldest_policy_index=None)
+
+        source = self.fake_swift.storage_policy[self.container_policy + 1]
+        destination = self.fake_swift.storage_policy[self.container_policy]
+        self.assertEqual(source.calls, [])
+        self.assertEqual(destination.calls, [])
+
+    def test_turn_cleanups_to_tombstones(self):
+        now = 1395760860.59528
+
+        # when an object update is received that changes an object's storage
+        # policy index, a cleanup record is created
+        self.broker.put_object(
+            'o1', normalize_timestamp(now - 0.001), 374202518, 'text/plain',
+            'd0ed3614637ae52456607488b796db9f', self.container_policy + 1)
+        self.broker.put_object(
+            'o1', normalize_timestamp(now), 374202518, 'text/plain',
+            'd0ed3614637ae52456607488b796db9f', self.container_policy)
+
+        self.broker.put_object(
+            'o2', normalize_timestamp(now - 0.001), 9577670, 'text/plain',
+            'ba29745e6dd00b9ab7755b52aff6d611', self.container_policy + 2)
+        self.broker.put_object(
+            'o2', normalize_timestamp(now), 9577670, 'text/plain',
+            'ba29745e6dd00b9ab7755b52aff6d611', self.container_policy)
+
+        self.broker._commit_puts()
+        # sanity check
+        self.assertEqual(len(self.broker.list_cleanups(999)), 2)
+
+        plusone = self.fake_swift.storage_policy[self.container_policy + 1]
+        plustwo = self.fake_swift.storage_policy[self.container_policy + 2]
+        plusone.register(
+            'DELETE', '/v1/a/c/o1', swob.HTTPNoContent, {}, None)
+        plustwo.register(
+            'DELETE', '/v1/a/c/o2', swob.HTTPNoContent, {}, None)
+
+        self.reconcile()
+
+        self.assertEqual(plusone.calls, [('DELETE', '/v1/a/c/o1')])
+        self.assertEqual(plustwo.calls, [('DELETE', '/v1/a/c/o2')])
+
+
+class TestReconcilerHelpers(unittest.TestCase):
+
+    def setUp(self):
+        self.fake_ring = FakeRing()
+
+    def test_direct_get_oldest_storage_policy_index(self):
+        mock_path = 'swift.container.updater.direct_head_container'
+        stub_resp_headers = [
+            {
+                'x-timestamp': '1393542492.31822',
+                'x-storage-policy-index': '0',
+            },
+            {
+                'x-timestamp': '1393542493.75106',
+                'x-storage-policy-index': '1',
+            },
+            {
+                'x-timestamp': '1393542492.31822',
+                'x-storage-policy-index': '0',
+            },
+        ]
+        with mock.patch(mock_path) as direct_head:
+            direct_head.side_effect = stub_resp_headers
+            oldest_spi = \
+                container_updater.direct_get_oldest_storage_policy_index(
+                    self.fake_ring, 'a', 'con')
+        self.assertEqual(oldest_spi, 0)
+
+    def test_get_oldest_storage_policy_index_with_error(self):
+        mock_path = 'swift.container.updater.direct_head_container'
+        stub_resp_headers = [
+            {
+                'x-timestamp': '1393542492.31822',
+                'x-storage-policy-index': '1',
+            },
+            {
+                'x-timestamp': '1393542499.31822',
+                'x-storage-policy-index': '0',
+            },
+            ClientException(
+                'Container Server blew up',
+                '10.0.0.1', 6001, 'sdb', 404, 'Not Found'
+            ),
+        ]
+        with mock.patch(mock_path) as direct_head:
+            direct_head.side_effect = stub_resp_headers
+            oldest_spi = \
+                container_updater.direct_get_oldest_storage_policy_index(
+                    self.fake_ring, 'a', 'con')
+        self.assertEqual(oldest_spi, 1)
+
+    def test_get_oldest_storage_policy_index_with_too_many_errors(self):
+        mock_path = 'swift.container.updater.direct_head_container'
+        stub_resp_headers = [
+            {
+                'x-timestamp': '1393542492.31822',
+                'x-storage-policy-index': '0',
+            },
+            ClientException(
+                'Container Server blew up',
+                '10.0.0.1', 6001, 'sdb', 404, 'Not Found'
+            ),
+            ClientException(
+                'Container Server blew up',
+                '10.0.0.12', 6001, 'sdj', 404, 'Not Found'
+            ),
+        ]
+        with mock.patch(mock_path) as direct_head:
+            direct_head.side_effect = stub_resp_headers
+            oldest_spi = \
+                container_updater.direct_get_oldest_storage_policy_index(
+                    self.fake_ring, 'a', 'con')
+        self.assertEqual(oldest_spi, None)
 
 
 if __name__ == '__main__':
