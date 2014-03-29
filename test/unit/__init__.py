@@ -42,17 +42,24 @@ from gzip import GzipFile
 
 DEFAULT_PATCH_POLICIES = [storage_policy.StoragePolicy(0, 'nulo', True),
                           storage_policy.StoragePolicy(1, 'unu')]
+LEGACY_PATCH_POLICIES = [storage_policy.StoragePolicy(0, 'legacy', True)]
 
 
-def patch_policies(thing_or_policies=None):
-    thing_or_policies = thing_or_policies or DEFAULT_PATCH_POLICIES
+def patch_policies(thing_or_policies=None, legacy_only=False):
+    if legacy_only:
+        default_policies = LEGACY_PATCH_POLICIES
+    else:
+        default_policies = DEFAULT_PATCH_POLICIES
+
+    thing_or_policies = thing_or_policies or default_policies
 
     if isinstance(thing_or_policies, storage_policy.StoragePolicyCollection):
         return PatchPolicies(thing_or_policies)
     elif isinstance(thing_or_policies, Iterable):
         return PatchPolicies(thing_or_policies)
     else:
-        return PatchPolicies()(thing_or_policies)
+        # it's a thing!
+        return PatchPolicies(default_policies)(thing_or_policies)
 
 
 class PatchPolicies(object):
@@ -62,8 +69,7 @@ class PatchPolicies(object):
     patched yet)
     """
 
-    def __init__(self, policies=None):
-        policies = policies or DEFAULT_PATCH_POLICIES
+    def __init__(self, policies):
         if isinstance(policies, storage_policy.StoragePolicyCollection):
             self.policies = policies
         else:

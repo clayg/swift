@@ -24,6 +24,7 @@ from eventlet import Timeout
 
 import swift.common.db
 from swift.container.backend import ContainerBroker, DATADIR
+from swift.container.replicator import ContainerReplicatorRpc
 from swift.common.db import DatabaseAlreadyExists
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.request_helpers import get_param, get_listing_content_type, \
@@ -36,7 +37,6 @@ from swift.common.constraints import check_mount, check_float, check_utf8
 from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout
-from swift.common.db_replicator import ReplicatorRpc
 from swift.common.http import HTTP_NOT_FOUND, is_success
 from swift.common.storage_policy import POLICIES, POLICY_INDEX
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPConflict, \
@@ -92,7 +92,7 @@ class ContainerController(object):
             h.strip()
             for h in conf.get('allowed_sync_hosts', '127.0.0.1').split(',')
             if h.strip()]
-        self.replicator_rpc = ReplicatorRpc(
+        self.replicator_rpc = ContainerReplicatorRpc(
             self.root, DATADIR, ContainerBroker, self.mount_check,
             logger=self.logger)
         self.auto_create_account_prefix = \
@@ -285,7 +285,8 @@ class ContainerController(object):
         recreated = broker.is_deleted()
         if recreated:
             # only set storage policy on deleted containers
-            broker.set_storage_policy_index(new_container_policy)
+            broker.set_storage_policy_index(new_container_policy,
+                                            timestamp=timestamp)
         broker.update_put_timestamp(timestamp)
         if broker.is_deleted():
             raise HTTPConflict(request=req)

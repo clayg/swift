@@ -562,6 +562,7 @@ class TestDatabaseBroker(unittest.TestCase):
                     created_at TEXT,
                     put_timestamp TEXT DEFAULT '0',
                     delete_timestamp TEXT DEFAULT '0',
+                    status_changed_at TEXT DEFAULT '0',
                     test_count INTEGER,
                     hash TEXT default '00000000000000000000000000000000',
                     id TEXT
@@ -571,8 +572,10 @@ class TestDatabaseBroker(unittest.TestCase):
             ''' % (metadata and ", metadata TEXT DEFAULT ''" or ""))
             conn.execute('''
                 UPDATE test_stat
-                SET account = ?, created_at = ?,  id = ?, put_timestamp = ?
-            ''', (broker.account, broker_creation, broker_uuid, put_timestamp))
+                SET account = ?, created_at = ?,  id = ?, put_timestamp = ?,
+                    status_changed_at = ?
+            ''', (broker.account, broker_creation, broker_uuid, put_timestamp,
+                  put_timestamp))
             if metadata:
                 conn.execute('UPDATE test_stat SET metadata = ?',
                              (broker_metadata,))
@@ -585,8 +588,8 @@ class TestDatabaseBroker(unittest.TestCase):
             'count': 0,
             'hash': '00000000000000000000000000000000',
             'created_at': broker_creation, 'put_timestamp': put_timestamp,
-            'delete_timestamp': '0', 'max_row': -1, 'id': broker_uuid,
-            'metadata': broker_metadata})
+            'delete_timestamp': '0', 'status_changed_at': put_timestamp,
+            'max_row': -1, 'id': broker_uuid, 'metadata': broker_metadata})
         insert_timestamp = normalize_timestamp(3)
         with broker.get() as conn:
             conn.execute('''
@@ -598,8 +601,8 @@ class TestDatabaseBroker(unittest.TestCase):
             'count': 1,
             'hash': 'bdc4c93f574b0d8c2911a27ce9dd38ba',
             'created_at': broker_creation, 'put_timestamp': put_timestamp,
-            'delete_timestamp': '0', 'max_row': 1, 'id': broker_uuid,
-            'metadata': broker_metadata})
+            'delete_timestamp': '0', 'status_changed_at': put_timestamp,
+            'max_row': 1, 'id': broker_uuid, 'metadata': broker_metadata})
         with broker.get() as conn:
             conn.execute('DELETE FROM test')
             conn.commit()
@@ -608,8 +611,8 @@ class TestDatabaseBroker(unittest.TestCase):
             'count': 0,
             'hash': '00000000000000000000000000000000',
             'created_at': broker_creation, 'put_timestamp': put_timestamp,
-            'delete_timestamp': '0', 'max_row': 1, 'id': broker_uuid,
-            'metadata': broker_metadata})
+            'delete_timestamp': '0', 'status_changed_at': put_timestamp,
+            'max_row': 1, 'id': broker_uuid, 'metadata': broker_metadata})
         return broker
 
     def test_metadata(self):

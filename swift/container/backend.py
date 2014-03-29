@@ -176,6 +176,12 @@ class ContainerBroker(DatabaseBroker):
                 status_changed_at = ?
             WHERE delete_timestamp < ? """, (timestamp, timestamp, timestamp))
 
+    def _get_replication_info_missing_defaults(self):
+        # XXX tests
+        parent = super(ContainerBroker, self)
+        return dict(storage_policy_index=0,
+                    **parent._get_replication_info_missing_defaults())
+
     def _commit_puts_load(self, item_list, entry):
         """See :func:`swift.common.db.DatabaseBroker._commit_puts_load`"""
         (name, timestamp, size, content_type, etag, deleted) = \
@@ -363,12 +369,14 @@ class ContainerBroker(DatabaseBroker):
                 SET x_container_sync_point2 = ?
             ''', (sync_point2,))
 
-    def set_storage_policy_index(self, policy_index):
+    def set_storage_policy_index(self, policy_index, timestamp=0):
+        # XXX tests
         def _setit(conn):
             conn.execute("""
                 UPDATE container_stat
-                SET storage_policy_index = ?
-            """, (policy_index,))
+                SET storage_policy_index = ?,
+                    status_changed_at = MAX(?, status_changed_at)
+            """, (policy_index, timestamp))
             conn.commit()
 
         with self.get() as conn:

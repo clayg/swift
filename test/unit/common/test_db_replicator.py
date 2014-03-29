@@ -252,6 +252,7 @@ class TestReplicator(db_replicator.Replicator):
     default_port = 1000
 
 
+@unit.patch_policies(legacy_only=True)
 class TestDBReplicator(unittest.TestCase):
     def setUp(self):
         db_replicator.ring = FakeRing()
@@ -1139,6 +1140,7 @@ class TestDBReplicator(unittest.TestCase):
                       replicator.logger))
 
 
+@unit.patch_policies(legacy_only=True)
 class TestReplToNode(unittest.TestCase):
     def setUp(self):
         db_replicator.ring = FakeRing()
@@ -1274,7 +1276,7 @@ class TestReplicatorSync(unittest.TestCase):
 
     def setUp(self):
         self.root = mkdtemp()
-        self.rpc = db_replicator.ReplicatorRpc(
+        self.rpc = self.replicator_rpc(
             self.root, self.datadir, self.backend, False,
             logger=unit.debug_logger())
         FakeReplConnection = attach_fake_replication_rpc(self.rpc)

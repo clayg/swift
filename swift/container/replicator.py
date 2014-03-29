@@ -13,8 +13,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
+
 from swift.container.backend import ContainerBroker, DATADIR
 from swift.common import db_replicator
+from swift.common.utils import json, normalize_timestamp
+from swift.common.http import is_success
+from swift.common.storage_policy import POLICIES
+
+
+def incorrect_policy_index(info, remote_info):
+    """
+    Compare remote_info to info and decide if the remote storage policy index
+    should be used instead of ours.
+    """
+    if 'storage_policy_index' not in remote_info:
+        return False
+    if remote_info['storage_policy_index'] == \
+            info['storage_policy_index']:
+        return False
+
+    def is_deleted(info):
+        return (info['delete_timestamp'] > info['put_timestamp'] and
+                info.get('count', info.get('object_count', 0)) == 0)
+
+    if is_deleted(remote_info):
+        if is_deleted(info):
+            return (
+                info['status_changed_at'] < remote_info['status_changed_at'])
+        return False
+    if is_deleted(info):
+        return True
+
+    def has_been_recreated(info):
+        return (info['put_timestamp'] > info['delete_timestamp'] >
+                normalize_timestamp(0))
+
+    remote_recreated = has_been_recreated(remote_info)
+    recreated = has_been_recreated(info)
+    if remote_recreated and (
+            remote_info['status_changed_at'] > info['status_changed_at']
+            or not recreated):
+        return True
+    elif not recreated and (
+            remote_info['status_changed_at'] < info['status_changed_at']):
+        return True
+    return False
 
 
 class ContainerReplicator(db_replicator.Replicator):
@@ -29,3 +73,49 @@ class ContainerReplicator(db_replicator.Replicator):
             if full_info['reported_' + key] != full_info[key]:
                 return False
         return True
+
+    def _gather_sync_args(self, replication_info):
+        parent = super(ContainerReplicator, self)
+        sync_args = parent._gather_sync_args(replication_info)
+        if len(POLICIES) > 1:
+            sync_args += tuple(replication_info[k] for k in
+                               ('status_changed_at', 'count',
+                                'storage_policy_index'))
+        return sync_args
+
+    def _handle_sync_response(self, node, response, info, broker, http):
+        parent = super(ContainerReplicator, self)
+        if is_success(response.status):
+            remote_info = json.loads(response.data)
+            if incorrect_policy_index(info, remote_info):
+                status_changed_at = normalize_timestamp(time.time())
+                broker.set_storage_policy_index(
+                    remote_info['storage_policy_index'],
+                    timestamp=status_changed_at)
+            broker.merge_timestamps(*(remote_info[key] for key in (
+                'created_at', 'put_timestamp', 'delete_timestamp')))
+        rv = parent._handle_sync_response(
+            node, response, info, broker, http)
+        return rv
+
+
+class ContainerReplicatorRpc(db_replicator.ReplicatorRpc):
+
+    def _parse_sync_args(self, args):
+        parent = super(ContainerReplicatorRpc, self)
+        remote_info = parent._parse_sync_args(args)
+        if len(args) > 9:
+            remote_info['status_changed_at'] = args[7]
+            remote_info['count'] = args[8]
+            remote_info['storage_policy_index'] = args[9]
+        return remote_info
+
+    def _handle_sync_request(self, broker, remote_info):
+        if incorrect_policy_index(broker.get_info(), remote_info):
+            status_changed_at = normalize_timestamp(time.time())
+            broker.set_storage_policy_index(
+                remote_info['storage_policy_index'],
+                timestamp=status_changed_at)
+        parent = super(ContainerReplicatorRpc, self)
+        rv = parent._handle_sync_request(broker, remote_info)
+        return rv
