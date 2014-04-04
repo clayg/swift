@@ -101,6 +101,7 @@ class ContainerReconciler(object):
         self.request_tries = int(conf.get('request_tries') or 3)
         self.conf_path = conf.get('__file__') or \
             '/etc/swift/container-updater.conf'
+        self.swift = None
 
     def get_swift(self):
         if not self.swift:
@@ -135,6 +136,13 @@ class ContainerReconciler(object):
         #
         # This means that no reconcilation will happen for a given container
         # unless a quorum of its primary servers are up.
+        if not broker.account:
+            broker.account = info['account']
+        if not broker.container:
+            broker.container = info['container']
+        print '*' * 50
+        print '%r, %r' % (broker.account, broker.container)
+        print '*' * 50
         real_spi = direct_get_oldest_storage_policy_index(
             self.get_container_ring(), broker.account, broker.container)
         if info['storage_policy_index'] != real_spi:
