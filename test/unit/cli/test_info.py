@@ -88,6 +88,7 @@ class TestCliInfo(unittest.TestCase):
             created_at=100.1,
             put_timestamp=106.3,
             delete_timestamp=107.9,
+            status_changed_at=107.9,
             object_count='20',
             bytes_used='42')
         info['hash'] = 'abaddeadbeefcafe'
@@ -104,6 +105,7 @@ Metadata:
   Created at: 1970-01-01 00:01:40.100000 (100.1)
   Put Timestamp: 1970-01-01 00:01:46.300000 (106.3)
   Delete Timestamp: 1970-01-01 00:01:47.900000 (107.9)
+  Status Timestamp: 1970-01-01 00:01:47.900000 (107.9)
   Object Count: 20
   Bytes Used: 42
   Chexor: abaddeadbeefcafe
@@ -120,6 +122,7 @@ No system metadata found in db file
             created_at='0000000100.10000',
             put_timestamp='0000000106.30000',
             delete_timestamp='0000000107.90000',
+            status_changed_at='0000000107.90000',
             object_count='20',
             bytes_used='42',
             reported_put_timestamp='0000010106.30000',
@@ -143,6 +146,7 @@ Metadata:
   Created at: 1970-01-01 00:01:40.100000 (0000000100.10000)
   Put Timestamp: 1970-01-01 00:01:46.300000 (0000000106.30000)
   Delete Timestamp: 1970-01-01 00:01:47.900000 (0000000107.90000)
+  Status Timestamp: 1970-01-01 00:01:47.900000 (0000000107.90000)
   Object Count: 20
   Bytes Used: 42
   Storage Policy: unu (1)
