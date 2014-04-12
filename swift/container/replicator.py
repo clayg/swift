@@ -16,49 +16,11 @@
 import time
 
 from swift.container.backend import ContainerBroker, DATADIR
+from swift.container.reconciler import incorrect_policy_index
 from swift.common import db_replicator
 from swift.common.utils import json, normalize_timestamp
 from swift.common.http import is_success
 from swift.common.storage_policy import POLICIES
-
-
-def incorrect_policy_index(info, remote_info):
-    """
-    Compare remote_info to info and decide if the remote storage policy index
-    should be used instead of ours.
-    """
-    if 'storage_policy_index' not in remote_info:
-        return False
-    if remote_info['storage_policy_index'] == \
-            info['storage_policy_index']:
-        return False
-
-    def is_deleted(info):
-        return (info['delete_timestamp'] > info['put_timestamp'] and
-                info.get('count', info.get('object_count', 0)) == 0)
-
-    if is_deleted(remote_info):
-        if is_deleted(info):
-            return (
-                info['status_changed_at'] < remote_info['status_changed_at'])
-        return False
-    if is_deleted(info):
-        return True
-
-    def has_been_recreated(info):
-        return (info['put_timestamp'] > info['delete_timestamp'] >
-                normalize_timestamp(0))
-
-    remote_recreated = has_been_recreated(remote_info)
-    recreated = has_been_recreated(info)
-    if remote_recreated and (
-            remote_info['status_changed_at'] > info['status_changed_at']
-            or not recreated):
-        return True
-    elif not recreated and (
-            remote_info['status_changed_at'] < info['status_changed_at']):
-        return True
-    return False
 
 
 class ContainerReplicator(db_replicator.Replicator):
