@@ -153,7 +153,7 @@ class ObjectController(object):
             device, partition, account, container, obj, policy_idx, **kwargs)
 
     def async_update(self, op, account, container, obj, host, partition,
-                     contdevice, headers_out, objdevice, policy_idx):
+                     contdevice, headers_out, objdevice, policy_index):
         """
         Sends or saves an async update.
 
@@ -167,9 +167,10 @@ class ObjectController(object):
         :param headers_out: dictionary of headers to send in the container
                             request
         :param objdevice: device name that the object is in
-        :param policy_idx: the associated storage policy index
+        :param policy_index: the associated storage policy index
         """
         headers_out['user-agent'] = 'obj-server %s' % os.getpid()
+        headers_out[POLICY_INDEX] = policy_index
         full_path = '/%s/%s/%s' % (account, container, obj)
         if all([host, partition, contdevice]):
             try:
@@ -199,7 +200,7 @@ class ObjectController(object):
         timestamp = headers_out['x-timestamp']
         self._diskfile_mgr.pickle_async_update(objdevice, account, container,
                                                obj, data, timestamp,
-                                               policy_idx)
+                                               policy_index)
 
     def container_update(self, op, account, container, obj, request,
                          headers_out, objdevice, policy_idx):

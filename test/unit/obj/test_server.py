@@ -23,6 +23,7 @@ import os
 import mock
 import unittest
 import math
+import random
 from shutil import rmtree
 from StringIO import StringIO
 from time import gmtime, strftime, time, struct_time
@@ -1996,6 +1997,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEquals(resp.headers['content-encoding'], 'gzip')
 
     def test_async_update_http_connect(self):
+        policy = random.choice(list(POLICIES))
         given_args = []
 
         def fake_http_connect(*args):
@@ -2007,19 +2009,21 @@ class TestObjectController(unittest.TestCase):
             object_server.http_connect = fake_http_connect
             self.object_controller.async_update(
                 'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
-                {'x-timestamp': '1', 'x-out': 'set'}, 'sda1', 0)
+                {'x-timestamp': '1', 'x-out': 'set'}, 'sda1', policy.idx)
         finally:
             object_server.http_connect = orig_http_connect
         self.assertEquals(
             given_args,
             ['127.0.0.1', '1234', 'sdc1', 1, 'PUT', '/a/c/o', {
                 'x-timestamp': '1', 'x-out': 'set',
-                'user-agent': 'obj-server %s' % os.getpid()}])
+                'user-agent': 'obj-server %s' % os.getpid(),
+                POLICY_INDEX: policy.idx}])
 
     @patch_policies([storage_policy.StoragePolicy(0, 'zero', True),
                      storage_policy.StoragePolicy(1, 'one'),
                      storage_policy.StoragePolicy(37, 'fantastico')])
     def test_updating_multiple_delete_at_container_servers(self):
+        policy = random.choice(list(POLICIES))
         self.object_controller.expiring_objects_account = 'exp'
         self.object_controller.expiring_objects_container_divisor = 60
 
@@ -2055,7 +2059,7 @@ class TestObjectController(unittest.TestCase):
             headers={'X-Timestamp': '12345',
                      'Content-Type': 'application/burrito',
                      'Content-Length': '0',
-                     'X-Storage-Policy-Index': '37',
+                     'X-Storage-Policy-Index': policy.idx,
                      'X-Container-Partition': '20',
                      'X-Container-Host': '1.2.3.4:5',
                      'X-Container-Device': 'sdb1',
@@ -2091,6 +2095,7 @@ class TestObjectController(unittest.TestCase):
                  'x-storage-policy-index': '37',
                  'referer': 'PUT http://localhost/sda1/p/a/c/o',
                  'user-agent': 'obj-server %d' % os.getpid(),
+                 POLICY_INDEX: policy.idx,
                  'x-trans-id': '-'})})
         self.assertEquals(
             http_connect_args[1],
@@ -2108,6 +2113,7 @@ class TestObjectController(unittest.TestCase):
                  'x-timestamp': '12345',
                  'referer': 'PUT http://localhost/sda1/p/a/c/o',
                  'user-agent': 'obj-server %d' % os.getpid(),
+                 POLICY_INDEX: 0,  # system account storage policy is 0
                  'x-trans-id': '-'})})
         self.assertEquals(
             http_connect_args[2],
@@ -2125,6 +2131,7 @@ class TestObjectController(unittest.TestCase):
                  'x-timestamp': '12345',
                  'referer': 'PUT http://localhost/sda1/p/a/c/o',
                  'user-agent': 'obj-server %d' % os.getpid(),
+                 POLICY_INDEX: 0,  # system account storage policy is 0
                  'x-trans-id': '-'})})
 
     @patch_policies([storage_policy.StoragePolicy(0, 'zero', True),
@@ -2213,6 +2220,7 @@ class TestObjectController(unittest.TestCase):
                  'x-trans-id': '-'})})
 
     def test_async_update_saves_on_exception(self):
+        policy = random.choice(list(POLICIES))
         _prefix = utils.HASH_PATH_PREFIX
         utils.HASH_PATH_PREFIX = ''
 
@@ -2224,19 +2232,22 @@ class TestObjectController(unittest.TestCase):
             object_server.http_connect = fake_http_connect
             self.object_controller.async_update(
                 'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
-                {'x-timestamp': '1', 'x-out': 'set'}, 'sda1', 0)
+                {'x-timestamp': '1', 'x-out': 'set'}, 'sda1', policy.idx)
         finally:
             object_server.http_connect = orig_http_connect
             utils.HASH_PATH_PREFIX = _prefix
+        async_dir = diskfile.get_async_dir(policy.idx)
         self.assertEquals(
             pickle.load(open(os.path.join(
-                self.testdir, 'sda1', 'async_pending', 'a83',
+                self.testdir, 'sda1', async_dir, 'a83',
                 '06fbf0b514e5199dfc4e00f42eb5ea83-0000000001.00000'))),
             {'headers': {'x-timestamp': '1', 'x-out': 'set',
-                         'user-agent': 'obj-server %s' % os.getpid()},
+                         'user-agent': 'obj-server %s' % os.getpid(),
+                         POLICY_INDEX: policy.idx},
              'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT'})
 
     def test_async_update_saves_on_non_2xx(self):
+        policy = random.choice(list(POLICIES))
         _prefix = utils.HASH_PATH_PREFIX
         utils.HASH_PATH_PREFIX = ''
 
@@ -2261,13 +2272,16 @@ class TestObjectController(unittest.TestCase):
                 object_server.http_connect = fake_http_connect(status)
                 self.object_controller.async_update(
                     'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
-                    {'x-timestamp': '1', 'x-out': str(status)}, 'sda1', 0)
+                    {'x-timestamp': '1', 'x-out': str(status)}, 'sda1',
+                    policy.idx)
+                async_dir = diskfile.get_async_dir(policy.idx)
                 self.assertEquals(
                     pickle.load(open(os.path.join(
-                        self.testdir, 'sda1', 'async_pending', 'a83',
+                        self.testdir, 'sda1', async_dir, 'a83',
                         '06fbf0b514e5199dfc4e00f42eb5ea83-0000000001.00000'))),
                     {'headers': {'x-timestamp': '1', 'x-out': str(status),
-                                 'user-agent': 'obj-server %s' % os.getpid()},
+                                 'user-agent': 'obj-server %s' % os.getpid(),
+                                 POLICY_INDEX: policy.idx},
                      'account': 'a', 'container': 'c', 'obj': 'o',
                      'op': 'PUT'})
         finally:
