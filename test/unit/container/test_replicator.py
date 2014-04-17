@@ -729,7 +729,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         part, node = self._get_broker_part_node(broker)
         daemon = self._run_once(node)
 
-        self.assertEqual(daemon.stats['success'], 2)
+        self.assertEqual(daemon.stats['success'], 4)
 
         # in sync
         broker = self._get_broker('a', 'c', node_index=0)

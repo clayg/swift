@@ -346,6 +346,8 @@ class ContainerBroker(DatabaseBroker):
             data = dict(data)
             # populate instance cache
             self._storage_policy_index = data['storage_policy_index']
+            self.account = data['account']
+            self.container = data['container']
             return data
 
     def set_x_container_sync_points(self, sync_point1, sync_point2):

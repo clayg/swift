@@ -156,6 +156,7 @@ class Replicator(Daemon):
         self.cpool = GreenPool(size=concurrency)
         swift_dir = conf.get('swift_dir', '/etc/swift')
         self.ring = ring.Ring(swift_dir, ring_name=self.server_type)
+        self._local_device_ids = set()
         self.per_diff = int(conf.get('per_diff', 1000))
         self.max_diffs = int(conf.get('max_diffs') or 100)
         self.interval = int(conf.get('interval') or
@@ -535,6 +536,7 @@ class Replicator(Daemon):
         if not ips:
             self.logger.error(_('ERROR Failed to get my own IPs?'))
             return
+        self._local_device_ids = set()
         for node in self.ring.devs:
             if (node and node['replication_ip'] in ips and
                     node['replication_port'] == self.port):
@@ -548,6 +550,7 @@ class Replicator(Daemon):
                     time.time() - self.reclaim_age)
                 datadir = os.path.join(self.root, node['device'], self.datadir)
                 if os.path.isdir(datadir):
+                    self._local_device_ids.add(node['id'])
                     dirs.append((datadir, node['id']))
         self.logger.info(_('Beginning replication run'))
         for part, object_file, node_id in roundrobin_datadirs(dirs):
