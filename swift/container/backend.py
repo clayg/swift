@@ -626,10 +626,30 @@ class ContainerBroker(DatabaseBroker):
             WHERE storage_policy_index != (
                 SELECT storage_policy_index FROM container_stat LIMIT 1)
             AND name > ?
+            %s
             LIMIT ?
         '''
         with self.get() as conn:
-            return list(conn.execute(query, (marker, limit)).fetchall())
+            if self.get_db_version(conn) >= 1:
+                clause = '''
+                AND deleted = 0
+                ORDER BY name
+                '''
+            else:
+                clause = '''
+                AND +deleted = 0
+                ORDER BY name
+                '''
+            cur = conn.execute(query % clause, (marker, limit))
+            return list(cur.fetchall())
+
+    def iter_misplaced_objects(self, batch_size=10000):
+        misplaced = self.list_misplaced_objects(batch_size)
+        while misplaced:
+            for obj in misplaced:
+                yield dict(obj)
+            misplaced = self.list_misplaced_objects(
+                batch_size, marker=obj['name'])
 
     def merge_items(self, item_list, source=None):
         """

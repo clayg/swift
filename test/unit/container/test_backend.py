@@ -1398,6 +1398,89 @@ class TestContainerBroker(unittest.TestCase):
             4931, broker.get_replication_info().get('storage_policy_index'))
 
 
+def pre_deleted_name_index_create_object_table(self, conn):
+    """
+    Dug out of ee4a9a^1
+    """
+    conn.executescript("""
+        CREATE TABLE object (
+            ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            created_at TEXT,
+            size INTEGER,
+            content_type TEXT,
+            etag TEXT,
+            deleted INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX ix_object_deleted ON object (deleted);
+
+        CREATE TRIGGER object_insert AFTER INSERT ON object
+        BEGIN
+            UPDATE container_stat
+            SET object_count = object_count + (1 - new.deleted),
+                bytes_used = bytes_used + new.size,
+                hash = chexor(hash, new.name, new.created_at);
+        END;
+
+        CREATE TRIGGER object_update BEFORE UPDATE ON object
+        BEGIN
+            SELECT RAISE(FAIL, 'UPDATE not allowed; DELETE and INSERT');
+        END;
+
+        CREATE TRIGGER object_delete AFTER DELETE ON object
+        BEGIN
+            UPDATE container_stat
+            SET object_count = object_count - (1 - old.deleted),
+                bytes_used = bytes_used - old.size,
+                hash = chexor(hash, old.name, old.created_at);
+        END;
+    """)
+
+
+class TestContainerBrokerBeforeIndex(TestContainerBroker):
+    """
+    Tests for ContainerBroker against databases created before
+    the updated index was added on the object table.
+    """
+
+    def setUp(self):
+        self._imported_create_container_stat_table = \
+            ContainerBroker.create_container_stat_table
+        self._imported_create_object_table = \
+            ContainerBroker.create_object_table
+        ContainerBroker.create_container_stat_table = \
+            prexsync_create_container_stat_table
+        ContainerBroker.create_object_table = \
+            pre_deleted_name_index_create_object_table
+        broker = ContainerBroker(':memory:', account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), 0)
+        self.assertEqual(broker._db_version, -1)
+        with broker.get() as conn:
+            version = broker.get_db_version(conn)
+        self.assertEqual(version, 0)
+        self.assertEqual(broker._db_version, version)
+
+    def tearDown(self):
+        ContainerBroker.create_container_stat_table = \
+            self._imported_create_container_stat_table
+        ContainerBroker.create_object_table = \
+            self._imported_create_object_table
+        broker = ContainerBroker(':memory:', account='a', container='c')
+        broker.initialize(normalize_timestamp('1'), 0)
+        self.assertEqual(broker._db_version, -1)
+        with broker.get() as conn:
+            version = broker.get_db_version(conn)
+        self.assertEqual(version, 1)
+        self.assertEqual(broker._db_version, version)
+
+    @classmethod
+    def get_broker_class(cls):
+        test_case = cls('get_broker_class')
+        test_case.setUp()
+        return ContainerBroker
+
+
 def prespi_create_object_table(self, conn):
     """
     Copied from ContainerBroker before the storage_policy_index column
