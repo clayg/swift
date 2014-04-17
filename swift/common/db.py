@@ -428,6 +428,7 @@ class DatabaseBroker(object):
         :param put_timestamp: put timestamp
         :param delete_timestamp: delete timestamp
         """
+        current_status = self.is_deleted()
         with self.get() as conn:
             conn.execute('''
                 UPDATE %s_stat SET created_at=MIN(?, created_at),
@@ -435,6 +436,9 @@ class DatabaseBroker(object):
                                    delete_timestamp=MAX(?, delete_timestamp)
             ''' % self.db_type, (created_at, put_timestamp, delete_timestamp))
             conn.commit()
+        if self.is_deleted() != current_status:
+            timestamp = normalize_timestamp(time.time())
+            self.update_status_changed_at(timestamp)
 
     def get_items_since(self, start, count):
         """
@@ -756,5 +760,18 @@ class DatabaseBroker(object):
             conn.execute(
                 'UPDATE %s_stat SET put_timestamp = ?'
                 ' WHERE put_timestamp < ?' % self.db_type,
+                (timestamp, timestamp))
+            conn.commit()
+
+    def update_status_changed_at(self, timestamp):
+        """
+        Update the status_changed_at filed in the stat table.  Only modifies
+        status_changed_at if the timestamp is greater than the current
+        status_changed_at timestamp.
+        """
+        with self.get() as conn:
+            conn.execute(
+                'UPDATE %s_stat SET status_changed_at = ?'
+                ' WHERE status_changed_at < ?' % self.db_type,
                 (timestamp, timestamp))
             conn.commit()

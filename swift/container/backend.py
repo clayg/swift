@@ -141,9 +141,11 @@ class ContainerBroker(DatabaseBroker):
         conn.execute('''
             UPDATE container_stat
             SET account = ?, container = ?, created_at = ?, id = ?,
-                put_timestamp = ?, storage_policy_index = ?
+                put_timestamp = ?, status_changed_at = ?,
+                storage_policy_index = ?
         ''', (self.account, self.container, normalize_timestamp(time.time()),
-              str(uuid4()), put_timestamp, storage_policy_index))
+              str(uuid4()), put_timestamp, put_timestamp,
+              storage_policy_index))
 
     def get_db_version(self, conn):
         if self._db_version == -1:

@@ -168,7 +168,12 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEqual(info['put_timestamp'], normalize_timestamp(start))
         self.assert_(float(info['created_at']) >= start)
         self.assertEqual(info['delete_timestamp'], '0')
-        self.assertEqual(info['status_changed_at'], '0')
+        if self.__class__ in (TestContainerBrokerBeforeMetadata,
+                              TestContainerBrokerBeforeXSync):
+            self.assertEqual(info['status_changed_at'], '0')
+        else:
+            self.assertEqual(info['status_changed_at'],
+                             normalize_timestamp(start))
 
         # delete it
         delete_timestamp = normalize_timestamp(ts.next())
@@ -428,7 +433,12 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEquals(info['hash'], '00000000000000000000000000000000')
         self.assertEqual(info['put_timestamp'], normalize_timestamp(1))
         self.assertEqual(info['delete_timestamp'], '0')
-        self.assertEqual(info['status_changed_at'], '0')
+        if self.__class__ in (TestContainerBrokerBeforeMetadata,
+                              TestContainerBrokerBeforeXSync):
+            self.assertEqual(info['status_changed_at'], '0')
+        else:
+            self.assertEqual(info['status_changed_at'],
+                             normalize_timestamp(1))
 
         info = broker.get_info()
         self.assertEquals(info['object_count'], 0)
@@ -1355,9 +1365,9 @@ def prespi_create_container_stat_table(self, conn, put_timestamp,
     conn.execute('''
         UPDATE container_stat
         SET account = ?, container = ?, created_at = ?, id = ?,
-            put_timestamp = ?
+            put_timestamp = ?, status_changed_at = ?
     ''', (self.account, self.container, normalize_timestamp(time()),
-          str(uuid4()), put_timestamp))
+          str(uuid4()), put_timestamp, put_timestamp))
 
 
 class TestContainerBrokerBeforeSPI(TestContainerBroker):

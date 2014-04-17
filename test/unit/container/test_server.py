@@ -199,7 +199,7 @@ class TestContainerController(unittest.TestCase):
         self.assertEqual(response.headers['x-backend-delete-timestamp'],
                          normalize_timestamp(0))
         self.assertEqual(response.headers['x-backend-status-changed-at'],
-                         normalize_timestamp(0))
+                         normalize_timestamp(start))
 
     def test_HEAD_not_found(self):
         req = Request.blank('/sda1/p/a/c', method='HEAD')
@@ -1025,6 +1025,7 @@ class TestContainerController(unittest.TestCase):
         info = db.get_info()
         self.assertEquals(info['put_timestamp'], normalize_timestamp('1'))
         self.assertEquals(info['delete_timestamp'], normalize_timestamp('2'))
+        self.assertEquals(info['status_changed_at'], normalize_timestamp('2'))
         # recreate
         req = Request.blank(path, method='PUT',
                             headers={'X-Timestamp': '4'})
@@ -1035,14 +1036,14 @@ class TestContainerController(unittest.TestCase):
         info = db.get_info()
         self.assertEquals(info['put_timestamp'], normalize_timestamp('4'))
         self.assertEquals(info['delete_timestamp'], normalize_timestamp('2'))
-        self.assertEquals(info['status_changed_at'], normalize_timestamp('2'))
+        self.assertEquals(info['status_changed_at'], normalize_timestamp('4'))
         for method in ('GET', 'HEAD'):
             req = Request.blank(path)
             resp = req.get_response(self.controller)
             expectations = {
                 'x-put-timestamp': normalize_timestamp(4),
                 'x-backend-delete-timestamp': normalize_timestamp(2),
-                'x-backend-status-changed-at': normalize_timestamp(2),
+                'x-backend-status-changed-at': normalize_timestamp(4),
             }
             for header, expected in expectations.items():
                 self.assertEqual(resp.headers[header], expected,

@@ -282,14 +282,16 @@ class ContainerController(object):
                 pass
             else:
                 return True  # created
-        created = broker.is_deleted()
-        if created:
+        recreated = broker.is_deleted()
+        if recreated:
             # only set storage policy on deleted containers
             broker.set_storage_policy_index(new_container_policy)
         broker.update_put_timestamp(timestamp)
         if broker.is_deleted():
             raise HTTPConflict(request=req)
-        return created
+        if recreated:
+            broker.update_status_changed_at(timestamp)
+        return recreated
 
     @public
     @timing_stats()

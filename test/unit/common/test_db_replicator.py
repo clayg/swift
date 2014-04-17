@@ -21,18 +21,19 @@ import errno
 import math
 import time
 from mock import patch, call
-from shutil import rmtree
+from shutil import rmtree, copy
 from tempfile import mkdtemp, NamedTemporaryFile
 import mock
 import simplejson
 
 from swift.container.backend import DATADIR
 from swift.common import db_replicator
-from swift.common.utils import normalize_timestamp
+from swift.common.utils import (normalize_timestamp, hash_path,
+                                storage_directory)
 from swift.common.exceptions import DriveNotMounted
 from swift.common.swob import HTTPException
 
-from test.unit import FakeLogger
+from test import unit
 
 
 TEST_ACCOUNT_NAME = 'a c t'
@@ -218,7 +219,7 @@ class FakeBroker(object):
         if self.stub_replication_info:
             return self.stub_replication_info
         return {'delete_timestamp': 0, 'put_timestamp': 1, 'count': 0,
-                'hash': 12345}
+                'hash': 12345, 'created_at': 1}
 
     def reclaim(self, item_timestamp, sync_timestamp):
         pass
@@ -448,7 +449,7 @@ class TestDBReplicator(unittest.TestCase):
 
     def test_run_once_no_ips(self):
         replicator = TestReplicator({})
-        replicator.logger = FakeLogger()
+        replicator.logger = unit.FakeLogger()
         self._patch(patch.object, db_replicator, 'whataremyips',
                     lambda *args: [])
 
@@ -461,7 +462,7 @@ class TestDBReplicator(unittest.TestCase):
     def test_run_once_node_is_not_mounted(self):
         db_replicator.ring = FakeRingWithSingleNode()
         replicator = TestReplicator({})
-        replicator.logger = FakeLogger()
+        replicator.logger = unit.FakeLogger()
         replicator.mount_check = True
         replicator.port = 6000
 
@@ -484,7 +485,7 @@ class TestDBReplicator(unittest.TestCase):
     def test_run_once_node_is_mounted(self):
         db_replicator.ring = FakeRingWithSingleNode()
         replicator = TestReplicator({})
-        replicator.logger = FakeLogger()
+        replicator.logger = unit.FakeLogger()
         replicator.mount_check = True
         replicator.port = 6000
 
@@ -597,7 +598,7 @@ class TestDBReplicator(unittest.TestCase):
         replicator.brokerclass = FakeAccountBroker
         replicator._repl_to_node = lambda *args: True
         replicator.delete_db = self.stub_delete_db
-        replicator.logger = FakeLogger()
+        replicator.logger = unit.FakeLogger()
         # Correct node_id, wrong part
         part = replicator.ring.get_part(TEST_ACCOUNT_NAME) + 1
         node_id = replicator.ring.get_part_nodes(part)[0]['id']
@@ -613,7 +614,7 @@ class TestDBReplicator(unittest.TestCase):
         replicator.ring = FakeRingWithNodes().Ring('path')
         replicator._repl_to_node = lambda *args: True
         replicator.delete_db = self.stub_delete_db
-        replicator.logger = FakeLogger()
+        replicator.logger = unit.FakeLogger()
         # Correct node_id, wrong part
         part = replicator.ring.get_part(
             TEST_ACCOUNT_NAME, TEST_CONTAINER_NAME) + 1
@@ -630,7 +631,7 @@ class TestDBReplicator(unittest.TestCase):
         replicator = TestReplicator({})
         replicator._zero_stats()
         replicator.extract_device = lambda _: 'some_device'
-        replicator.logger = FakeLogger()
+        replicator.logger = unit.FakeLogger()
 
         temp_dir = mkdtemp()
         try:
@@ -1225,6 +1226,111 @@ class TestReplToNode(unittest.TestCase):
         self.http = mock.Mock(replicate=mock.Mock(return_value=None))
         self.assertEquals(self.replicator._repl_to_node(
             self.fake_node, FakeBroker(), '0', self.fake_info), False)
+
+
+class FakeHTTPResponse(object):
+
+    def __init__(self, resp):
+        self.resp = resp
+
+    @property
+    def status(self):
+        return self.resp.status_int
+
+    @property
+    def data(self):
+        return self.resp.body
+
+
+def attach_fake_replication_rpc(rpc, replicate_hook=None):
+    class FakeReplConnection(object):
+
+        def __init__(self, node, partition, hash_, logger):
+            self.logger = logger
+            self.node = node
+            self.partition = partition
+            self.path = '/%s/%s/%s' % (node['device'], partition, hash_)
+            self.host = node['replication_ip']
+
+        def replicate(self, op, *sync_args):
+            print 'REPLICATE: %s, %s, %r' % (self.path, op, sync_args)
+            replicate_args = self.path.lstrip('/').split('/')
+            args = [op] + list(sync_args)
+            swob_response = rpc.dispatch(replicate_args, args)
+            resp = FakeHTTPResponse(swob_response)
+            if replicate_hook:
+                replicate_hook(op, *sync_args)
+            return resp
+
+    return FakeReplConnection
+
+
+class TestReplicatorSync(unittest.TestCase):
+
+    backend = None  # override in subclass
+    datadir = None
+    replicator_daemon = db_replicator.Replicator
+    replicator_rpc = db_replicator.ReplicatorRpc
+
+    def setUp(self):
+        self.root = mkdtemp()
+        self.rpc = db_replicator.ReplicatorRpc(
+            self.root, self.datadir, self.backend, False,
+            logger=unit.debug_logger())
+        FakeReplConnection = attach_fake_replication_rpc(self.rpc)
+        self._orig_ReplConnection = db_replicator.ReplConnection
+        db_replicator.ReplConnection = FakeReplConnection
+        self._orig_Ring = db_replicator.ring.Ring
+        self._ring = unit.FakeRing()
+        db_replicator.ring.Ring = lambda *args, **kwargs: self._get_ring()
+        self.logger = unit.debug_logger()
+
+    def tearDown(self):
+        db_replicator.ReplConnection = self._orig_ReplConnection
+        db_replicator.ring.Ring = self._orig_Ring
+        rmtree(self.root)
+
+    def _get_ring(self):
+        return self._ring
+
+    def _get_broker(self, account, container=None, node_index=0):
+        hash_ = hash_path(account, container)
+        part, nodes = self._ring.get_nodes(account, container)
+        drive = nodes[node_index]['device']
+        db_path = os.path.join(self.root, drive,
+                               storage_directory(self.datadir, part, hash_),
+                               hash_ + '.db')
+        return self.backend(db_path, account=account, container=container)
+
+    def _get_broker_part_node(self, broker):
+        part, nodes = self._ring.get_nodes(broker.account, broker.container)
+        storage_dir = broker.db_file[len(self.root):].lstrip(os.path.sep)
+        broker_device = storage_dir.split(os.path.sep, 1)[0]
+        for node in nodes:
+            if node['device'] == broker_device:
+                return part, node
+
+    def _run_once(self, node, conf_updates=None, daemon=None):
+        conf = {
+            'devices': self.root,
+            'recon_cache_path': self.root,
+            'mount_check': 'false',
+            'bind_port': node['replication_port'],
+        }
+        if conf_updates:
+            conf.update(conf_updates)
+        daemon = daemon or self.replicator_daemon(conf, logger=self.logger)
+
+        def _rsync_file(db_file, remote_file, **kwargs):
+            remote_server, remote_path = remote_file.split('/', 1)
+            dest_path = os.path.join(self.root, remote_path)
+            copy(db_file, dest_path)
+            return True
+        daemon._rsync_file = _rsync_file
+        with mock.patch('swift.common.db_replicator.whataremyips',
+                        new=lambda: [node['replication_ip']]):
+            daemon.run_once()
+        return daemon
 
 
 if __name__ == '__main__':
