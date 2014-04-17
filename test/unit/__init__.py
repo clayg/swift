@@ -39,6 +39,7 @@ from swift.common import storage_policy
 import functools
 import cPickle as pickle
 from gzip import GzipFile
+import mock as mocklib
 
 DEFAULT_PATCH_POLICIES = [storage_policy.StoragePolicy(0, 'nulo', True),
                           storage_policy.StoragePolicy(1, 'unu')]
@@ -623,7 +624,10 @@ def fake_http_connect(*code_iter, **kwargs):
                     self._next_sleep = None
 
         def getresponse(self):
-            if kwargs.get('raise_exc'):
+            exc = kwargs.get('raise_exc')
+            if exc:
+                if isinstance(exc, Exception):
+                    raise exc
                 raise Exception('test')
             if kwargs.get('raise_timeout_exc'):
                 raise Timeout()
@@ -751,3 +755,11 @@ def fake_http_connect(*code_iter, **kwargs):
     connect.code_iter = code_iter
 
     return connect
+
+
+@contextmanager
+def mocked_http_conn(*args, **kwargs):
+    fake_conn = fake_http_connect(*args, **kwargs)
+    with mocklib.patch('swift.common.bufferedhttp.http_connect_raw',
+                       new=fake_conn):
+        yield fake_conn
