@@ -17,6 +17,9 @@ import cPickle as pickle
 import mock
 import os
 import unittest
+import random
+import itertools
+import urllib
 from contextlib import closing
 from gzip import GzipFile
 from tempfile import mkdtemp
@@ -27,13 +30,13 @@ from distutils.dir_util import mkpath
 from eventlet import spawn, Timeout, listen
 
 from swift.obj import updater as object_updater
-from swift.obj.diskfile import ASYNCDIR_BASE, get_async_dir
+from swift.obj.diskfile import ASYNCDIR_BASE, get_async_dir, DiskFileManager
 from swift.common.ring import RingData
-from swift.common import utils
+from swift.common import utils, swob
 from swift.common.utils import hash_path, normalize_timestamp, mkdirs, \
     write_pickle
-from test.unit import debug_logger, patch_policies
-from swift.common.storage_policy import StoragePolicy, POLICIES
+from test.unit import debug_logger, patch_policies, mocked_http_conn
+from swift.common.storage_policy import StoragePolicy, POLICIES, POLICY_INDEX
 
 
 _mocked_policies = [StoragePolicy(0, 'zero', False),
@@ -342,6 +345,66 @@ class TestObjectUpdater(unittest.TestCase):
         self.assert_(not os.path.exists(op_path))
         self.assertEqual(cu.logger.get_increment_counts(),
                          {'unlinks': 1, 'successes': 1})
+
+    def test_obj_put_conflict(self):
+        ts = itertools.count(int(time()))
+        policy = random.choice(list(POLICIES))
+        # setup updater
+        conf = {
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+        }
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
+        async_dir = os.path.join(self.sda1, get_async_dir(policy.idx))
+        os.mkdir(async_dir)
+
+        # write an async
+        dfmanager = DiskFileManager(conf, daemon.logger)
+        account, container, obj = 'a', 'c', 'o'
+        op = 'PUT'
+        headers_out = swob.HeaderKeyDict({
+            'x-size': 0,
+            'x-content-type': 'text/plain',
+            'x-etag': 'd41d8cd98f00b204e9800998ecf8427e',
+            'x-timestamp': ts.next(),
+        })
+        data = {'op': op, 'account': account, 'container': container,
+                'obj': obj, 'headers': headers_out}
+        dfmanager.pickle_async_update(self.sda1, account, container, obj,
+                                      data, ts.next(), policy.idx)
+
+        request_log = []
+
+        def capture(*args, **kwargs):
+            request_log.append((args, kwargs))
+
+        # run once
+        fake_status_codes = [
+            200,  # object update success
+            200,  # object update success
+            409,  # object update conflict
+            200, 200, 200,  # enqueue
+        ]
+        with mocked_http_conn(*fake_status_codes, give_connect=capture):
+            daemon.run_once()
+        self.assertEqual(len(fake_status_codes), len(request_log))
+        for request_args, request_kwargs in request_log[:3]:
+            ip, part, method, path, headers, qs, ssl = request_args
+            self.assertEqual(method, 'PUT')
+            self.assertEqual(headers[POLICY_INDEX], str(policy.idx))
+        for request_args, request_kwargs in request_log[3:]:
+            ip, part, method, path, headers, qs, ssl = request_args
+            self.assertEqual(method, 'PUT')
+            device, part, reconciler_account, reconciler_container, q_item = \
+                utils.split_path(path, maxsegs=5, rest_with_last=True)
+            self.assertEqual(reconciler_account, '.misplaced_objects')
+            policy_index, obj_path = urllib.unquote(q_item).split(':', 1)
+            self.assertEqual(policy_index, str(policy.idx))
+            expected_path = '/%s/%s/%s' % (account, container, obj)
+            self.assertEqual(obj_path, expected_path)
+        self.assertEqual(daemon.logger.get_increment_counts(),
+                         {'successes': 1, 'unlinks': 1, 'async_pendings': 1})
 
 
 if __name__ == '__main__':

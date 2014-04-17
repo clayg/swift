@@ -32,7 +32,9 @@ from swift.common.utils import get_logger, renamer, write_pickle, \
 from swift.common.daemon import Daemon
 from swift.obj.diskfile import get_async_dir, ASYNCDIR_BASE
 from swift.common.http import is_success, HTTP_NOT_FOUND, \
-    HTTP_INTERNAL_SERVER_ERROR
+    HTTP_INTERNAL_SERVER_ERROR, HTTP_CONFLICT
+
+from swift.container.reconciler import add_to_reconciler_queue
 
 
 class ObjectUpdater(Daemon):
@@ -226,11 +228,21 @@ class ObjectUpdater(Daemon):
                 headers[POLICY_INDEX] = str(policy_idx)
                 status = self.object_update(node, part, update['op'], obj,
                                             headers)
-                if not is_success(status) and status != HTTP_NOT_FOUND:
-                    success = False
-                else:
+                if is_success(status) or status == HTTP_NOT_FOUND:
                     successes.append(node['id'])
                     new_successes = True
+                elif status == HTTP_CONFLICT:
+                    success = add_to_reconciler_queue(
+                        container_ring,
+                        update['account'], update['container'], update['obj'],
+                        policy_idx,
+                        update['headers']['x-timestamp'],
+                        update['op'])
+                    if success:
+                        successes.append(node['id'])
+                        new_successes = True
+                else:
+                    success = False
         if success:
             self.successes += 1
             self.logger.increment('successes')

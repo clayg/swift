@@ -18,14 +18,18 @@ import sys
 import unittest
 import uuid
 import itertools
+import time
 
 from swift.common.manager import Manager
-from swift.common.storage_policy import POLICIES
+from swift.common.storage_policy import POLICIES, POLICY_INDEX
 from swift.common import direct_client
+from swift.common.http import HTTP_NOT_FOUND
 from test.probe.common import reset_environment, get_to_final_state
 
 
-from swiftclient import client, get_auth
+from swiftclient import client, get_auth, ClientException
+
+TIMEOUT = 60
 
 
 class BrainSpliter(object):
@@ -103,7 +107,30 @@ class TestContainerMergePolicyIndex(unittest.TestCase):
         self.assert_(len(found_policy_indexes) > 1,
                      'primary nodes did not disagree about policy index %r' %
                      head_responses)
+        # find our object
+        orig_policy_index = None
+        for policy_index in found_policy_indexes:
+            object_ring = POLICIES.get_object_ring(policy_index, '/etc/swift')
+            part, nodes = object_ring.get_nodes(
+                self.account, self.container_name, self.object_name)
+            for node in nodes:
+                try:
+                    direct_client.direct_head_object(
+                        node, part, self.account, self.container_name,
+                        self.object_name, headers={POLICY_INDEX: policy_index})
+                except direct_client.ClientException as err:
+                    continue
+                orig_policy_index = policy_index
+                break
+            if orig_policy_index is not None:
+                break
+        else:
+            self.fail('Unable to find /%s/%s/%s in %r' % (
+                self.account, self.container_name, self.object_name,
+                found_policy_indexes))
         get_to_final_state()
+        Manager(['container-updater', 'container-reconciler']).once()
+        # validate containers
         head_responses = []
         for node in container_nodes:
             metadata = direct_client.direct_head_container(
@@ -114,6 +141,43 @@ class TestContainerMergePolicyIndex(unittest.TestCase):
         self.assert_(len(found_policy_indexes) == 1,
                      'primary nodes disagree about policy index %r' %
                      head_responses)
+        expected_policy_index = found_policy_indexes.pop()
+        self.assertNotEqual(orig_policy_index, expected_policy_index)
+        # validate object placement
+        orig_policy_ring = POLICIES.get_object_ring(orig_policy_index,
+                                                    '/etc/swift')
+        for node in orig_policy_ring.devs:
+            try:
+                direct_client.direct_head_object(
+                    node, part, self.account, self.container_name,
+                    self.object_name, headers={
+                        POLICY_INDEX: orig_policy_index})
+            except direct_client.ClientException as err:
+                if err.http_status == HTTP_NOT_FOUND:
+                    continue
+                raise
+            else:
+                self.fail('Found /%s/%s/%s in %s' % (
+                    self.account, self.container_name, self.object_name,
+                    orig_policy_index))
+        # use proxy to access object (bad container info might be cached...)
+        timeout = time.time() + TIMEOUT
+        while time.time() < timeout:
+            try:
+                metadata = client.head_object(self.url, self.token,
+                                              self.container_name,
+                                              self.object_name)
+            except ClientException as err:
+                if err.http_status != HTTP_NOT_FOUND:
+                    raise
+                time.sleep(1)
+            else:
+                break
+        else:
+            self.fail('could not HEAD /%s/%s/%s/ from policy %s '
+                      'after %s seconds.' % (
+                          self.account, self.container_name, self.object_name,
+                          expected_policy_index, TIMEOUT))
 
 
 if __name__ == "__main__":
