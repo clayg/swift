@@ -30,7 +30,7 @@ from tempfile import mkdtemp
 from shutil import rmtree
 from test import get_config
 from swift.common.utils import config_true_value, LogAdapter
-from swift.common.ring import RingData
+from swift.common.ring import Ring, RingData
 from hashlib import md5
 from eventlet import sleep, Timeout
 import logging.handlers
@@ -294,6 +294,22 @@ def temptree(files, contents=''):
         yield tempdir
     finally:
         rmtree(tempdir)
+
+
+def with_tempdir(f):
+    """
+    Decorator to give a single test a tempdir as argument to test method.
+    """
+    @functools.wraps(f)
+    def wrapped(*args, **kwargs):
+        tempdir = mkdtemp()
+        args = list(args)
+        args.append(tempdir)
+        try:
+            return f(*args, **kwargs)
+        finally:
+            rmtree(tempdir)
+    return wrapped
 
 
 class NullLoggingHandler(logging.Handler):
