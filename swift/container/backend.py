@@ -73,7 +73,8 @@ class ContainerBroker(DatabaseBroker):
                 size INTEGER,
                 content_type TEXT,
                 etag TEXT,
-                deleted INTEGER DEFAULT 0
+                deleted INTEGER DEFAULT 0,
+                storage_policy_index INTEGER
             );
 
             CREATE INDEX ix_object_deleted_name ON object (deleted, name);
@@ -141,9 +142,11 @@ class ContainerBroker(DatabaseBroker):
         conn.execute('''
             UPDATE container_stat
             SET account = ?, container = ?, created_at = ?, id = ?,
-                put_timestamp = ?, storage_policy_index = ?
+                put_timestamp = ?, status_changed_at = ?,
+                storage_policy_index = ?
         ''', (self.account, self.container, normalize_timestamp(time.time()),
-              str(uuid4()), put_timestamp, storage_policy_index))
+              str(uuid4()), put_timestamp, put_timestamp,
+              storage_policy_index))
 
     def get_db_version(self, conn):
         if self._db_version == -1:
@@ -174,16 +177,27 @@ class ContainerBroker(DatabaseBroker):
                 status_changed_at = ?
             WHERE delete_timestamp < ? """, (timestamp, timestamp, timestamp))
 
+    def _get_replication_info_missing_defaults(self):
+        # XXX tests
+        parent = super(ContainerBroker, self)
+        return dict(storage_policy_index=0,
+                    **parent._get_replication_info_missing_defaults())
+
     def _commit_puts_load(self, item_list, entry):
         """See :func:`swift.common.db.DatabaseBroker._commit_puts_load`"""
-        (name, timestamp, size, content_type, etag, deleted) = \
-            pickle.loads(entry.decode('base64'))
+        data = pickle.loads(entry.decode('base64'))
+        (name, timestamp, size, content_type, etag, deleted) = data[:6]
+        if len(data) > 6:
+            storage_policy_index = data[6]
+        else:
+            storage_policy_index = 0
         item_list.append({'name': name,
                           'created_at': timestamp,
                           'size': size,
                           'content_type': content_type,
                           'etag': etag,
-                          'deleted': deleted})
+                          'deleted': deleted,
+                          'storage_policy_index': storage_policy_index})
 
     def empty(self):
         """
@@ -197,16 +211,18 @@ class ContainerBroker(DatabaseBroker):
                 'SELECT object_count from container_stat').fetchone()
             return (row[0] == 0)
 
-    def delete_object(self, name, timestamp):
+    def delete_object(self, name, timestamp, storage_policy_index=0):
         """
         Mark an object deleted.
 
         :param name: object name to be deleted
         :param timestamp: timestamp when the object was marked as deleted
         """
-        self.put_object(name, timestamp, 0, 'application/deleted', 'noetag', 1)
+        self.put_object(name, timestamp, 0, 'application/deleted', 'noetag',
+                        deleted=1, storage_policy_index=storage_policy_index)
 
-    def put_object(self, name, timestamp, size, content_type, etag, deleted=0):
+    def put_object(self, name, timestamp, size, content_type, etag, deleted=0,
+                   storage_policy_index=0):
         """
         Creates an object in the DB with its metadata.
 
@@ -217,10 +233,12 @@ class ContainerBroker(DatabaseBroker):
         :param etag: object etag
         :param deleted: if True, marks the object as deleted and sets the
                         deteleted_at timestamp to timestamp
+        :param storage_policy_index: the storage policy index for the object
         """
         record = {'name': name, 'created_at': timestamp, 'size': size,
                   'content_type': content_type, 'etag': etag,
-                  'deleted': deleted}
+                  'deleted': deleted,
+                  'storage_policy_index': storage_policy_index}
         if self.db_file == ':memory:':
             self.merge_items([record])
             return
@@ -242,7 +260,8 @@ class ContainerBroker(DatabaseBroker):
                     # delimiter
                     fp.write(':')
                     fp.write(pickle.dumps(
-                        (name, timestamp, size, content_type, etag, deleted),
+                        (name, timestamp, size, content_type, etag, deleted,
+                         storage_policy_index),
                         protocol=PICKLE_PROTOCOL).encode('base64'))
                     fp.flush()
 
@@ -252,32 +271,33 @@ class ContainerBroker(DatabaseBroker):
 
         :returns: True if the DB is considered to be deleted, False otherwise
         """
+        _info, is_deleted = self.get_info_is_deleted(timestamp=timestamp)
+        return is_deleted
+
+    def get_info_is_deleted(self, timestamp=None):
         if self.db_file != ':memory:' and not os.path.exists(self.db_file):
-            return True
-        self._commit_puts_stale_ok()
-        with self.get() as conn:
-            row = conn.execute('''
-                SELECT put_timestamp, delete_timestamp, object_count
-                FROM container_stat''').fetchone()
-            # leave this db as a tombstone for a consistency window
-            if timestamp and row['delete_timestamp'] > timestamp:
-                return False
-            # The container is considered deleted if the delete_timestamp
-            # value is greater than the put_timestamp, and there are no
-            # objects in the container.
-            return (row['object_count'] in (None, '', 0, '0')) and \
-                (float(row['delete_timestamp']) > float(row['put_timestamp']))
+            return {}, True
+        info = self.get_info()
+        # leave this db as a tombstone for a consistency window
+        if timestamp and info['delete_timestamp'] > timestamp:
+            return info, False
+        # The container is considered deleted if the delete_timestamp
+        # value is greater than the put_timestamp, and there are no
+        # objects in the container.
+        is_deleted = (info['object_count'] in (None, '', 0, '0')) and \
+            (float(info['delete_timestamp']) > float(info['put_timestamp']))
+        return info, is_deleted
 
     def get_info(self):
         """
         Get global data for the container.
 
         :returns: dict with keys: account, container, created_at,
-                  put_timestamp, delete_timestamp, object_count, bytes_used,
-                  reported_put_timestamp, reported_delete_timestamp,
-                  reported_object_count, reported_bytes_used, hash, id,
-                  x_container_sync_point1, x_container_sync_point2, and
-                  storage_policy_index.
+                  put_timestamp, delete_timestamp, status_changed_at,
+                  object_count, bytes_used, reported_put_timestamp,
+                  reported_delete_timestamp, reported_object_count,
+                  reported_bytes_used, hash, id, x_container_sync_point1,
+                  x_container_sync_point2, and storage_policy_index.
         """
         self._commit_puts_stale_ok()
         with self.get() as conn:
@@ -288,10 +308,10 @@ class ContainerBroker(DatabaseBroker):
                 try:
                     data = conn.execute('''
                         SELECT account, container, created_at, put_timestamp,
-                            delete_timestamp, object_count, bytes_used,
-                            reported_put_timestamp, reported_delete_timestamp,
-                            reported_object_count, reported_bytes_used, hash,
-                            id, %s, %s
+                            delete_timestamp, status_changed_at, object_count,
+                            bytes_used, reported_put_timestamp,
+                            reported_delete_timestamp, reported_object_count,
+                            reported_bytes_used, hash, id, %s, %s
                         FROM container_stat
                     ''' % (trailing_sync, trailing_pol)).fetchone()
                 except sqlite3.OperationalError as err:
@@ -305,6 +325,8 @@ class ContainerBroker(DatabaseBroker):
             data = dict(data)
             # populate instance cache
             self._storage_policy_index = data['storage_policy_index']
+            self.account = data['account']
+            self.container = data['container']
             return data
 
     def set_x_container_sync_points(self, sync_point1, sync_point2):
@@ -354,12 +376,16 @@ class ContainerBroker(DatabaseBroker):
                 SET x_container_sync_point2 = ?
             ''', (sync_point2,))
 
-    def set_storage_policy_index(self, policy_index):
+    def set_storage_policy_index(self, policy_index, timestamp=None):
+        if timestamp is None:
+            timestamp = normalize_timestamp(time.time())
+
         def _setit(conn):
             conn.execute("""
                 UPDATE container_stat
-                SET storage_policy_index = ?
-            """, (policy_index,))
+                SET storage_policy_index = ?,
+                    status_changed_at = MAX(?, status_changed_at)
+            """, (policy_index, timestamp))
             conn.commit()
 
         with self.get() as conn:
@@ -392,7 +418,7 @@ class ContainerBroker(DatabaseBroker):
             conn.commit()
 
     def list_objects_iter(self, limit, marker, end_marker, prefix, delimiter,
-                          path=None):
+                          path=None, storage_policy_index=0):
         """
         Get a list of objects sorted by name starting at marker onward, up
         to limit entries.  Entries will begin with the prefix and will not
@@ -445,9 +471,17 @@ class ContainerBroker(DatabaseBroker):
                     query += ' +deleted = 0'
                 else:
                     query += ' deleted = 0'
+                query += ' AND storage_policy_index = %s' \
+                    % storage_policy_index
                 query += ' ORDER BY name LIMIT ?'
                 query_args.append(limit - len(results))
-                curs = conn.execute(query, query_args)
+                try:
+                    curs = conn.execute(query, query_args)
+                except sqlite3.OperationalError as err:
+                    if 'no such column: storage_policy_index' not in str(err):
+                        raise
+                    self._migrate_object_storage_policy_index(conn)
+                    curs = conn.execute(query, query_args)
                 curs.row_factory = None
 
                 if prefix is None:
@@ -502,26 +536,34 @@ class ContainerBroker(DatabaseBroker):
                           'size', 'content_type', 'etag', 'deleted'}
         :param source: if defined, update incoming_sync with the source
         """
-        with self.get() as conn:
+        def _really_merge_items(conn):
             max_rowid = -1
             for rec in item_list:
+                rec.setdefault('storage_policy_index', 0)  # legacy
                 query = '''
                     DELETE FROM object
                     WHERE name = ? AND (created_at < ?)
+                    AND storage_policy_index = ?
                 '''
                 if self.get_db_version(conn) >= 1:
                     query += ' AND deleted IN (0, 1)'
-                conn.execute(query, (rec['name'], rec['created_at']))
-                query = 'SELECT 1 FROM object WHERE name = ?'
+                conn.execute(query, (rec['name'], rec['created_at'],
+                                     rec['storage_policy_index']))
+                query = '''
+                    SELECT 1 FROM object WHERE name = ?
+                    AND storage_policy_index = ?
+                '''
                 if self.get_db_version(conn) >= 1:
                     query += ' AND deleted IN (0, 1)'
-                if not conn.execute(query, (rec['name'],)).fetchall():
+                if not conn.execute(query, (
+                        rec['name'], rec['storage_policy_index'])).fetchall():
                     conn.execute('''
                         INSERT INTO object (name, created_at, size,
-                            content_type, etag, deleted)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                            content_type, etag, deleted, storage_policy_index)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                     ''', ([rec['name'], rec['created_at'], rec['size'],
-                          rec['content_type'], rec['etag'], rec['deleted']]))
+                          rec['content_type'], rec['etag'], rec['deleted'],
+                           rec['storage_policy_index']]))
                 if source:
                     max_rowid = max(max_rowid, rec['ROWID'])
             if source:
@@ -537,6 +579,54 @@ class ContainerBroker(DatabaseBroker):
                     ''', (max_rowid, source))
             conn.commit()
 
+        with self.get() as conn:
+            try:
+                return _really_merge_items(conn)
+            except sqlite3.OperationalError as err:
+                if 'no such column: storage_policy_index' not in str(err):
+                    raise
+                self._migrate_object_storage_policy_index(conn)
+                return _really_merge_items(conn)
+
+    def list_misplaced_objects(self, limit, marker=''):
+        """
+        Get a list of objects sorted by name which are in a storage policy
+        different from the container's storage policy.
+
+        :param limit: maximum number of entries to get
+        :param marker: marker query
+
+        :returns: list of tuples of (name, created_at, size, content_type,
+                  etag, storage_policy_index)
+        """
+        query = '''
+            SELECT name, created_at, size, content_type, etag,
+                   deleted, storage_policy_index
+            FROM object
+            WHERE storage_policy_index != (
+                SELECT storage_policy_index FROM container_stat LIMIT 1)
+            AND name > ?
+            %s
+            ORDER BY name LIMIT ?
+        '''
+        with self.get() as conn:
+            if self.get_db_version(conn) >= 1:
+                clause = '''
+                AND deleted in (1, 0)
+                '''
+            else:
+                clause = ''
+            cur = conn.execute(query % clause, (marker, limit))
+            return list(dict(row) for row in cur.fetchall())
+
+    def iter_misplaced_objects(self, batch_size=10000):
+        misplaced = self.list_misplaced_objects(batch_size)
+        while misplaced:
+            for obj in misplaced:
+                yield dict(obj)
+            misplaced = self.list_misplaced_objects(
+                batch_size, marker=obj['name'])
+
     def _migrate_add_storage_policy_index(self, conn):
         """
         Add the storage_policy_index column to the 'container_stat' table.
@@ -546,4 +636,13 @@ class ContainerBroker(DatabaseBroker):
             ADD COLUMN storage_policy_index INTEGER;
 
             UPDATE container_stat SET storage_policy_index=0;
+        ''')
+
+    def _migrate_object_storage_policy_index(self, conn):
+        """
+        Add the storage_policy_index column to the 'object' table.
+        """
+        conn.executescript('''
+            ALTER TABLE object
+            ADD COLUMN storage_policy_index INTEGER DEFAULT 0;
         ''')

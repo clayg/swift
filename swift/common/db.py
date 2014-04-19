@@ -428,6 +428,7 @@ class DatabaseBroker(object):
         :param put_timestamp: put timestamp
         :param delete_timestamp: delete timestamp
         """
+        current_status = self.is_deleted()
         with self.get() as conn:
             conn.execute('''
                 UPDATE %s_stat SET created_at=MIN(?, created_at),
@@ -435,6 +436,9 @@ class DatabaseBroker(object):
                                    delete_timestamp=MAX(?, delete_timestamp)
             ''' % self.db_type, (created_at, put_timestamp, delete_timestamp))
             conn.commit()
+        if self.is_deleted() != current_status:
+            timestamp = normalize_timestamp(time.time())
+            self.update_status_changed_at(timestamp)
 
     def get_items_since(self, start, count):
         """
@@ -486,6 +490,9 @@ class DatabaseBroker(object):
                 result.append({'remote_id': row[0], 'sync_point': row[1]})
             return result
 
+    def _get_replication_info_missing_defaults(self):
+        return {'metadata': ''}
+
     def get_replication_info(self):
         """
         Get information about the DB required for replication.
@@ -496,24 +503,45 @@ class DatabaseBroker(object):
         self._commit_puts_stale_ok()
         query_part1 = '''
             SELECT hash, id, created_at, put_timestamp, delete_timestamp,
-                %s_count AS count,
+                status_changed_at, %s_count AS count,
                 CASE WHEN SQLITE_SEQUENCE.seq IS NOT NULL
-                    THEN SQLITE_SEQUENCE.seq ELSE -1 END AS max_row, ''' % \
+                    THEN SQLITE_SEQUENCE.seq ELSE -1 END AS max_row ''' % \
             self.db_contains_type
         query_part2 = '''
             FROM (%s_stat LEFT JOIN SQLITE_SEQUENCE
                   ON SQLITE_SEQUENCE.name == '%s') LIMIT 1
         ''' % (self.db_type, self.db_contains_type)
+
+        missing_defaults = self._get_replication_info_missing_defaults()
+
+        # missing columns with a default will be dropped from the query during
+        # retry and the default data added to the results at the end
+        extra_defaults = {}
         with self.get() as conn:
-            try:
-                curs = conn.execute(query_part1 + 'metadata' + query_part2)
-            except sqlite3.OperationalError as err:
-                if 'no such column: metadata' not in str(err):
-                    raise
-                curs = conn.execute(query_part1 + "'' as metadata" +
-                                    query_part2)
+            while True:
+                extra_columns = ''
+                for column_name in missing_defaults:
+                    extra_columns += ', %s' % column_name
+                try:
+                    curs = conn.execute(
+                        query_part1 + extra_columns + query_part2)
+                except sqlite3.OperationalError as err:
+                    err_msg = str(err)
+                    for column_name in missing_defaults:
+                        if 'no such column: %s' % column_name in err_msg:
+                            extra_defaults[column_name] = \
+                                missing_defaults.pop(column_name)
+                            break
+                    else:
+                        # no missing default column_name in err_msg
+                        raise
+                else:
+                    # did not catch sqlite error
+                    break
             curs.row_factory = dict_factory
-            return curs.fetchone()
+            result = curs.fetchone()
+            result.update(extra_defaults)
+            return result
 
     def _commit_puts(self, item_list=None):
         """
@@ -756,5 +784,18 @@ class DatabaseBroker(object):
             conn.execute(
                 'UPDATE %s_stat SET put_timestamp = ?'
                 ' WHERE put_timestamp < ?' % self.db_type,
+                (timestamp, timestamp))
+            conn.commit()
+
+    def update_status_changed_at(self, timestamp):
+        """
+        Update the status_changed_at filed in the stat table.  Only modifies
+        status_changed_at if the timestamp is greater than the current
+        status_changed_at timestamp.
+        """
+        with self.get() as conn:
+            conn.execute(
+                'UPDATE %s_stat SET status_changed_at = ?'
+                ' WHERE status_changed_at < ?' % self.db_type,
                 (timestamp, timestamp))
             conn.commit()
