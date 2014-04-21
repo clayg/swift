@@ -30,6 +30,24 @@ from swift.common.db import DatabaseBroker, DatabaseConnectionError, \
 
 DATADIR = 'containers'
 
+POLICY_STAT_TRIGGER_SCRIPT = """
+    CREATE TRIGGER object_insert_ps AFTER INSERT ON object
+    BEGIN
+        INSERT OR REPLACE INTO policy_stat (
+            storage_policy_index, object_count)
+        VALUES (new.storage_policy_index, coalesce((
+                    SELECT object_count FROM policy_stat
+                    WHERE storage_policy_index = new.storage_policy_index
+                ) + 1, 1));
+    END;
+    CREATE TRIGGER object_delete_ps AFTER DELETE ON object
+    BEGIN
+        UPDATE policy_stat
+        SET object_count = object_count - (1 - old.deleted)
+        WHERE storage_policy_index = old.storage_policy_index;
+    END;
+"""
+
 
 class ContainerBroker(DatabaseBroker):
     """Encapsulates working with a container database."""
@@ -57,6 +75,7 @@ class ContainerBroker(DatabaseBroker):
         self.create_object_table(conn)
         self.create_container_stat_table(conn, put_timestamp,
                                          storage_policy_index)
+        self.create_policy_stat_table(conn)
 
     def create_object_table(self, conn):
         """
@@ -99,7 +118,7 @@ class ContainerBroker(DatabaseBroker):
                     bytes_used = bytes_used - old.size,
                     hash = chexor(hash, old.name, old.created_at);
             END;
-        """)
+        """ + POLICY_STAT_TRIGGER_SCRIPT)
 
     def create_container_stat_table(self, conn, put_timestamp,
                                     storage_policy_index):
@@ -147,6 +166,26 @@ class ContainerBroker(DatabaseBroker):
         ''', (self.account, self.container, normalize_timestamp(time.time()),
               str(uuid4()), put_timestamp, put_timestamp,
               storage_policy_index))
+
+    def create_policy_stat_table(self, conn):
+        """
+        Create policy_stat table which is specific to the account DB.
+        Not a part of Pluggable Back-ends, internal to the baseline code.
+
+        :param conn: DB connection object
+        """
+        conn.executescript("""
+            CREATE TABLE policy_stat (
+                storage_policy_index INTEGER PRIMARY KEY,
+                object_count INTEGER
+            );
+            INSERT OR IGNORE INTO policy_stat (
+                storage_policy_index, object_count
+            )
+            SELECT 0, object_count
+            FROM container_stat
+            WHERE object_count > 0;
+        """)
 
     def get_db_version(self, conn):
         if self._db_version == -1:
@@ -480,7 +519,7 @@ class ContainerBroker(DatabaseBroker):
                 except sqlite3.OperationalError as err:
                     if 'no such column: storage_policy_index' not in str(err):
                         raise
-                    self._migrate_object_storage_policy_index(conn)
+                    self._migrate_object_storage_policy(conn)
                     curs = conn.execute(query, query_args)
                 curs.row_factory = None
 
@@ -585,7 +624,7 @@ class ContainerBroker(DatabaseBroker):
             except sqlite3.OperationalError as err:
                 if 'no such column: storage_policy_index' not in str(err):
                     raise
-                self._migrate_object_storage_policy_index(conn)
+                self._migrate_object_storage_policy(conn)
                 return _really_merge_items(conn)
 
     def list_misplaced_objects(self, limit, marker=''):
@@ -638,11 +677,16 @@ class ContainerBroker(DatabaseBroker):
             UPDATE container_stat SET storage_policy_index=0;
         ''')
 
-    def _migrate_object_storage_policy_index(self, conn):
+    def _migrate_object_storage_policy(self, conn):
         """
         Add the storage_policy_index column to the 'object' table.
         """
+        try:
+            self.create_policy_stat_table(conn)
+        except sqlite3.OperationalError as err:
+            if 'table policy_stat already exists' not in str(err):
+                raise
         conn.executescript('''
             ALTER TABLE object
             ADD COLUMN storage_policy_index INTEGER DEFAULT 0;
-        ''')
+        ''' + POLICY_STAT_TRIGGER_SCRIPT)
