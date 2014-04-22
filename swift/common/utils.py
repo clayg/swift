@@ -2367,6 +2367,59 @@ class InputProxy(object):
         return line
 
 
+class LRUCache(object):
+    """
+    Decorator for size/time bound memonization that evicts the least recently
+    used memebers.
+    """
+
+    PREV, NEXT, KEY, TIMEOUT, VALUE = 0, 1, 2, 3, 4  # link fields
+
+    def __init__(self, maxsize=1000, maxtime=3600):
+        self.maxsize = maxsize
+        self.maxtime = maxtime
+        self.mapping = {}
+
+        self.head = [None, None, None, None, None]  # oldest
+        self.tail = [self.head, None, None, None, None]  # newest
+        self.head[self.NEXT] = self.tail
+
+    def __call__(self, f):
+        self.original_function = f
+        return self.wrapped
+
+    def get_wrapped(self, *key):
+        value = self.original_function(*key)
+        if len(self.mapping) >= self.maxsize:
+            old_next, old_key = self.head[self.NEXT][self.NEXT:self.NEXT + 2]
+            self.head[self.NEXT], old_next[self.PREV] = old_next, self.head
+            del self.mapping[old_key]
+        last = self.tail[self.PREV]
+        link = [last, self.tail, key, time.time() + self.maxtime, value]
+        self.mapping[key] = last[self.NEXT] = self.tail[self.PREV] = link
+        return value
+
+    def get_cached(self, link, *key):
+        link_prev, link_next, key, timeout, value = link
+        if time.time() >= timeout:
+            return self.get_wrapped(*key)
+        link_prev[self.NEXT] = link_next
+        link_next[self.PREV] = link_prev
+        last = self.tail[self.PREV]
+        last[self.NEXT] = self.tail[self.PREV] = link
+        link[self.PREV] = last
+        link[self.NEXT] = self.tail
+        return value
+
+    def wrapped(self, *key):
+        link = self.mapping.get(key, self.head)
+        if link is self.head:
+            value = self.get_wrapped(*key)
+        else:
+            value = self.get_cached(link, *key)
+        return value
+
+
 def tpool_reraise(func, *args, **kwargs):
     """
     Hack to work around Eventlet's tpool not catching and reraising Timeouts.

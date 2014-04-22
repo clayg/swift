@@ -25,7 +25,8 @@ from swift.common import constraints
 from swift.common.daemon import Daemon
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.utils import get_logger, split_path, quorum_size, \
-    FileLikeIter, normalize_timestamp, last_modified_date_to_timestamp
+    FileLikeIter, normalize_timestamp, last_modified_date_to_timestamp, \
+    LRUCache
 from swift.common.direct_client import (
     direct_head_container, direct_delete_container_object,
     direct_put_container_object, ClientException)
@@ -33,6 +34,7 @@ from swift.common.direct_client import (
 
 MISPLACED_OBJECTS_ACCOUNT = '.misplaced_objects'
 MISPLACED_OBJECTS_CONTAINER_DIVISOR = 3600  # 1 hour
+CONTAINER_POLICY_TTL = 30
 
 
 def incorrect_policy_index(info, remote_info):
@@ -232,6 +234,21 @@ def translate_container_headers_to_info(headers):
     }
 
 
+def best_policy_index(headers):
+    container_info = map(translate_container_headers_to_info, headers)
+
+    def cmp(x, y):
+        if x['storage_policy_index'] == y['storage_policy_index']:
+            return 0
+        if incorrect_policy_index(x, y):
+            return 1  # push the liars to the end of the list
+        else:
+            return -1
+    container_info.sort(cmp=cmp)
+    return int(container_info[0]['storage_policy_index'])
+
+
+@LRUCache(maxtime=CONTAINER_POLICY_TTL)
 def direct_get_container_policy_index(container_ring, account_name,
                                       container_name):
     """
@@ -261,10 +278,7 @@ def direct_get_container_policy_index(container_ring, account_name,
     headers = [x for x in pile if x is not None]
     if len(headers) < quorum_size(len(nodes)):
         return
-    container_info = map(translate_container_headers_to_info, headers)
-    container_info.sort(
-        cmp=lambda x, y: 1 if incorrect_policy_index(x, y) else -1)
-    return int(container_info[0]['storage_policy_index'])
+    return best_policy_index(headers)
 
 
 def direct_delete_container_entry(container_ring, account_name, container_name,
@@ -303,13 +317,6 @@ class ContainerReconciler(Daemon):
                                     request_tries)
         self.stats = defaultdict(int)
         self.last_stat_time = time.time()
-
-    def run_forever(self, *args, **kwargs):
-        while True:
-            self.run_once(*args, **kwargs)
-            self.stats = defaultdict(int)
-            self.logger.info('sleeping between intervals (%s)', self.interval)
-            time.sleep(self.interval)
 
     def pop_queue(self, container, obj, q_timestamp, q_record):
         q_path = '/%s/%s/%s' % (MISPLACED_OBJECTS_ACCOUNT, container, obj)
@@ -523,82 +530,95 @@ class ContainerReconciler(Daemon):
             self.last_stat_time = now
             self.logger.info('Reconciler Stats: %r', dict(**self.stats))
 
-    def _iter_misplaced_objects(self):
+    def reconcile_object(self, info):
+        self.logger.debug('checking placement for %r (%s) '
+                          'in policy_index %s', info['path'],
+                          info['q_timestamp'], info['q_policy_index'])
+        success = False
+        try:
+            success = self.ensure_object_in_right_location(**info)
+        except:  # noqa
+            self.logger.exception('Unhandled Exception trying to '
+                                  'reconcile %r (%s) in policy_index %s',
+                                  info['path'], info['q_timestamp'],
+                                  info['q_policy_index'])
+        if success:
+            metric = 'success'
+            msg = '%(path)r (%(q_timestamp)f) in policy_index ' \
+                '%(q_policy_index)s was handled successfully'
+        else:
+            metric = 'retry'
+            msg = '%(path)r (%(q_timestamp)f) in policy_index ' \
+                '%(q_policy_index)s must be retried'
+        self.stats_log(metric, msg, info, level=logging.INFO)
+        self.log_stats()
+        return success
+
+    def _iter_containers(self):
+        # hit most recent container first instead of waiting on the updaters
+        current_container = get_reconciler_container_name(time.time())
+        yield current_container
         container_gen = self.swift.iter_containers(MISPLACED_OBJECTS_ACCOUNT)
+        self.logger.debug('looking for containers in %s',
+                          MISPLACED_OBJECTS_ACCOUNT)
         while True:
             one_page = list(itertools.islice(
                 container_gen, constraints.CONTAINER_LISTING_LIMIT))
             if not one_page:
+                # don't generally expect more than one page
                 break
+            # reversed order since we expect older containers to be empty
             for c in reversed(one_page):
                 # encoding here is defensive
                 container = c['name'].encode('utf8')
-                self.logger.debug('looking for objects in %s', container)
-                found_obj = False
-                for raw_obj in self.swift.iter_objects(
-                        MISPLACED_OBJECTS_ACCOUNT, container):
-                    found_obj = True
-                    try:
-                        obj_info = parse_raw_obj(raw_obj)
-                    except Exception:
-                        self.stats_log('invalid_record',
-                                       'invalid queue record: %r', raw_obj,
-                                       level=logging.ERROR, exc_info=True)
-                        continue
-                    finished = yield obj_info
-                    if finished:
-                        self.pop_queue(container, raw_obj['name'],
-                                       obj_info['q_timestamp'],
-                                       obj_info['q_record'])
-                self.log_stats()
-                self.logger.debug('finished container %s', container)
-                if float(container) < time.time() - self.reclaim_age and \
-                        not found_obj:
-                    # Try to delete old empty containers so the queue doesn't
-                    # grow without bound. It's ok if there's a conflict.
-                    self.swift.delete_container(
-                        MISPLACED_OBJECTS_ACCOUNT, container,
-                        acceptable_statuses=(2, 404, 409, 412))
+                if container == current_container:
+                    continue  # we've already hit this one this pass
+                yield container
+
+    def _iter_objects(self, container):
+        self.logger.debug('looking for objects in %s', container)
+        found_obj = False
+        for raw_obj in self.swift.iter_objects(
+                MISPLACED_OBJECTS_ACCOUNT, container):
+            found_obj = True
+            yield raw_obj
+        if float(container) < time.time() - self.reclaim_age and \
+                not found_obj:
+            # Try to delete old empty containers so the queue doesn't
+            # grow without bound. It's ok if there's a conflict.
+            self.swift.delete_container(
+                MISPLACED_OBJECTS_ACCOUNT, container,
+                acceptable_statuses=(2, 404, 409, 412))
+
+    def reconcile(self):
+        self.logger.debug('pulling items from the queue')
+        for container in self._iter_containers():
+            for raw_obj in self._iter_objects(container):
+                try:
+                    obj_info = parse_raw_obj(raw_obj)
+                except Exception:
+                    self.stats_log('invalid_record',
+                                   'invalid queue record: %r', raw_obj,
+                                   level=logging.ERROR, exc_info=True)
+                    continue
+                finished = self.reconcile_object(obj_info)
+                if finished:
+                    self.pop_queue(container, raw_obj['name'],
+                                   obj_info['q_timestamp'],
+                                   obj_info['q_record'])
+            self.log_stats()
+            self.logger.debug('finished container %s', container)
 
     def run_once(self, *args, **kwargs):
         """
         Process every entry in the queue.
         """
-        self.logger.debug('pulling items from the queue')
-        q = self._iter_misplaced_objects()
-        for info in sending(q, lambda: success):
-            self.logger.debug('checking placement for %r (%s) '
-                              'in policy_index %s', info['path'],
-                              info['q_timestamp'], info['q_policy_index'])
-            success = False
-            try:
-                success = self.ensure_object_in_right_location(**info)
-            except:  # noqa
-                self.logger.exception('Unhandled Exception trying to '
-                                      'reconcile %r (%s) in policy_index %s',
-                                      info['path'], info['q_timestamp'],
-                                      info['q_policy_index'])
-            if success:
-                metric = 'success'
-                msg = '%(path)r (%(q_timestamp)f) in policy_index ' \
-                    '%(q_policy_index)s was handled successfully'
-            else:
-                metric = 'retry'
-                msg = '%(path)r (%(q_timestamp)f) in policy_index ' \
-                    '%(q_policy_index)s must be retried'
-            self.stats_log(metric, msg, info, level=logging.INFO)
-            self.log_stats()
+        self.reconcile()
         self.log_stats(force=True)
 
-
-# TODO(clayg): try and invert control so I don't have to do this
-def sending(g, sender):
-    """
-    Iterate over g with send
-
-    :params g: the iterable
-    :params sender: the callable returning the value to send
-    """
-    yield g.next()
-    while True:
-        yield g.send(sender())
+    def run_forever(self, *args, **kwargs):
+        while True:
+            self.run_once(*args, **kwargs)
+            self.stats = defaultdict(int)
+            self.logger.info('sleeping between intervals (%s)', self.interval)
+            time.sleep(self.interval)

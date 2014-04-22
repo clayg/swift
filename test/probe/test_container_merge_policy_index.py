@@ -68,8 +68,12 @@ class BrainSpliter(object):
                           self.object_name)
 
     def delete_object(self):
-        client.delete_object(self.url, self.token, self.container_name,
-                             self.object_name)
+        try:
+            client.delete_object(self.url, self.token, self.container_name,
+                                 self.object_name)
+        except ClientException as err:
+            if err.http_status != HTTP_NOT_FOUND:
+                raise
 
 
 class TestContainerMergePolicyIndex(unittest.TestCase):
@@ -129,7 +133,7 @@ class TestContainerMergePolicyIndex(unittest.TestCase):
                 self.account, self.container_name, self.object_name,
                 found_policy_indexes))
         get_to_final_state()
-        Manager(['container-updater', 'container-reconciler']).once()
+        Manager(['container-reconciler']).once()
         # validate containers
         head_responses = []
         for node in container_nodes:
@@ -178,6 +182,88 @@ class TestContainerMergePolicyIndex(unittest.TestCase):
                       'after %s seconds.' % (
                           self.account, self.container_name, self.object_name,
                           expected_policy_index, TIMEOUT))
+
+    def test_reconcile_delete(self):
+        # generic split brain
+        self.brain.stop_first_half()
+        self.brain.put_container()
+        self.brain.put_object()
+        self.brain.start_first_half()
+        self.brain.stop_second_half()
+        self.brain.put_container()
+        self.brain.delete_object()
+        self.brain.start_second_half()
+        # make sure we have some mannor of split brain
+        container_part, container_nodes = self.container_ring.get_nodes(
+            self.account, self.container_name)
+        head_responses = []
+        for node in container_nodes:
+            metadata = direct_client.direct_head_container(
+                node, container_part, self.account, self.container_name)
+            head_responses.append((node, metadata))
+        found_policy_indexes = set(metadata['x-storage-policy-index'] for
+                                   node, metadata in head_responses)
+        self.assert_(len(found_policy_indexes) > 1,
+                     'primary nodes did not disagree about policy index %r' %
+                     head_responses)
+        # find our object
+        orig_policy_index = ts_policy_index = None
+        for policy_index in found_policy_indexes:
+            object_ring = POLICIES.get_object_ring(policy_index, '/etc/swift')
+            part, nodes = object_ring.get_nodes(
+                self.account, self.container_name, self.object_name)
+            for node in nodes:
+                try:
+                    direct_client.direct_head_object(
+                        node, part, self.account, self.container_name,
+                        self.object_name, headers={POLICY_INDEX: policy_index})
+                except direct_client.ClientException as err:
+                    if 'x-timestamp' in err.http_headers:
+                        ts_policy_index = policy_index
+                        break
+                else:
+                    orig_policy_index = policy_index
+                    break
+        if not orig_policy_index:
+            self.fail('Unable to find /%s/%s/%s in %r' % (
+                self.account, self.container_name, self.object_name,
+                found_policy_indexes))
+        if not ts_policy_index:
+            self.fail('Unable to find tombstone /%s/%s/%s in %r' % (
+                self.account, self.container_name, self.object_name,
+                found_policy_indexes))
+        get_to_final_state()
+        Manager(['container-reconciler']).once()
+        # validate containers
+        head_responses = []
+        for node in container_nodes:
+            metadata = direct_client.direct_head_container(
+                node, container_part, self.account, self.container_name)
+            head_responses.append((node, metadata))
+        found_policy_indexes = set(metadata['x-storage-policy-index'] for
+                                   node, metadata in head_responses)
+        self.assert_(len(found_policy_indexes) == 1,
+                     'primary nodes disagree about policy index %r' %
+                     head_responses)
+        expected_policy_index = found_policy_indexes.pop()
+        self.assertEqual(orig_policy_index, expected_policy_index)
+        # validate object fully deleted
+        for policy_index in found_policy_indexes:
+            object_ring = POLICIES.get_object_ring(policy_index, '/etc/swift')
+            part, nodes = object_ring.get_nodes(
+                self.account, self.container_name, self.object_name)
+            for node in nodes:
+                try:
+                    direct_client.direct_head_object(
+                        node, part, self.account, self.container_name,
+                        self.object_name, headers={POLICY_INDEX: policy_index})
+                except direct_client.ClientException as err:
+                    if err.http_status == HTTP_NOT_FOUND:
+                        continue
+                else:
+                    self.fail('Found /%s/%s/%s in %s on %s' % (
+                        self.account, self.container_name, self.object_name,
+                        orig_policy_index, node))
 
 
 if __name__ == "__main__":

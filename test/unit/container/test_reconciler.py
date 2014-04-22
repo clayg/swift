@@ -235,19 +235,28 @@ class TestReconcilerUtils(unittest.TestCase):
         ts = itertools.count(int(time.time()))
         mock_path = 'swift.container.reconciler.direct_head_container'
         stub_resp_headers = [
-            container_resp_headers(status_changed_at=ts.next(),
-                                   storage_policy_index=0),
-            container_resp_headers(status_changed_at=ts.next(),
-                                   storage_policy_index=1),
-            container_resp_headers(status_changed_at=ts.next(),
-                                   storage_policy_index=0),
+            container_resp_headers(
+                status_changed_at=normalize_timestamp(ts.next()),
+                storage_policy_index=0,
+            ),
+            container_resp_headers(
+                status_changed_at=normalize_timestamp(ts.next()),
+                storage_policy_index=1,
+            ),
+            container_resp_headers(
+                status_changed_at=normalize_timestamp(ts.next()),
+                storage_policy_index=0,
+            ),
         ]
-        random.shuffle(stub_resp_headers)
-        with mock.patch(mock_path) as direct_head:
-            direct_head.side_effect = stub_resp_headers
-            oldest_spi = reconciler.direct_get_container_policy_index(
-                self.fake_ring, 'a', 'con')
-        self.assertEqual(oldest_spi, 0)
+        for permutation in itertools.permutations((0, 1, 2)):
+            stub_resp_headers = [stub_resp_headers[i] for i in permutation]
+            with mock.patch(mock_path) as direct_head:
+                direct_head.side_effect = stub_resp_headers
+                oldest_spi = reconciler.direct_get_container_policy_index(
+                    self.fake_ring, 'a', 'con')
+            self.assertEqual(oldest_spi, 0,
+                             "oldest policy index wrong "
+                             "for permutation %r" % (permutation,))
 
     def test_get_container_policy_index_with_error(self):
         ts = itertools.count(int(time.time()))
@@ -459,11 +468,57 @@ class TestReconcilerUtils(unittest.TestCase):
                 storage_policy_index=2,
             ),
         ]
+        random.shuffle(stub_resp_headers)
         with mock.patch(mock_path) as direct_head:
             direct_head.side_effect = stub_resp_headers
             oldest_spi = reconciler.direct_get_container_policy_index(
                 self.fake_ring, 'a', 'con')
         self.assertEqual(oldest_spi, 1)
+
+    def test_get_container_policy_index_cache(self):
+        ts = itertools.count(int(time.time()))
+        mock_path = 'swift.container.reconciler.direct_head_container'
+        stub_resp_headers = [
+            container_resp_headers(
+                status_changed_at=normalize_timestamp(ts.next()),
+                storage_policy_index=0,
+            ),
+            container_resp_headers(
+                status_changed_at=normalize_timestamp(ts.next()),
+                storage_policy_index=1,
+            ),
+            container_resp_headers(
+                status_changed_at=normalize_timestamp(ts.next()),
+                storage_policy_index=0,
+            ),
+        ]
+        random.shuffle(stub_resp_headers)
+        with mock.patch(mock_path) as direct_head:
+            direct_head.side_effect = stub_resp_headers
+            oldest_spi = reconciler.direct_get_container_policy_index(
+                self.fake_ring, 'a', 'con')
+        self.assertEqual(oldest_spi, 0)
+        # re-mock with errors
+        stub_resp_headers = [
+            socket.error(errno.ECONNREFUSED, os.strerror(errno.ECONNREFUSED)),
+            socket.error(errno.ECONNREFUSED, os.strerror(errno.ECONNREFUSED)),
+            socket.error(errno.ECONNREFUSED, os.strerror(errno.ECONNREFUSED)),
+        ]
+        with mock.patch(mock_path) as direct_head:
+            direct_head.side_effect = stub_resp_headers
+            oldest_spi = reconciler.direct_get_container_policy_index(
+                self.fake_ring, 'a', 'con')
+        # still cached
+        self.assertEqual(oldest_spi, 0)
+        # propel time forward
+        the_future = time.time() + 31
+        with mock.patch('time.time', new=lambda: the_future):
+            with mock.patch(mock_path) as direct_head:
+                direct_head.side_effect = stub_resp_headers
+                oldest_spi = reconciler.direct_get_container_policy_index(
+                    self.fake_ring, 'a', 'con')
+        # expired
+        self.assertEqual(oldest_spi, None)
 
     def test_direct_delete_container_entry(self):
         mock_path = 'swift.common.direct_client.http_connect'
@@ -636,6 +691,9 @@ class TestReconciler(unittest.TestCase):
         with mock.patch('swift.container.reconciler.InternalClient'):
             self.reconciler = reconciler.ContainerReconciler(conf)
         self.reconciler.logger = self.logger
+        self.start_interval = int(time.time() // 3600 * 3600)
+        self.current_container_path = '/v1/.misplaced_objects/%d' % (
+            self.start_interval) + listing_qs('')
 
     def _mock_listing(self, objects):
         self.reconciler.swift = FakeInternalClient(objects)
@@ -661,10 +719,12 @@ class TestReconciler(unittest.TestCase):
             'direct_delete_container_entry': mock.DEFAULT,
         }
 
+        mock_time_iter = itertools.count(self.start_interval)
         with mock.patch.multiple(reconciler, **items) as mocks:
             self.mock_delete_container_entry = \
                 mocks['direct_delete_container_entry']
-            self.reconciler.run_once()
+            with mock.patch('time.time', mock_time_iter.next):
+                self.reconciler.run_once()
 
         return [c[1][1:4] for c in
                 mocks['direct_delete_container_entry'].mock_calls]
@@ -677,7 +737,8 @@ class TestReconciler(unittest.TestCase):
         # we try to find something useful
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -700,7 +761,8 @@ class TestReconciler(unittest.TestCase):
         # we get all the queue entries we can
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -729,7 +791,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -769,7 +832,8 @@ class TestReconciler(unittest.TestCase):
         # we look for misplaced objects
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -794,7 +858,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -840,7 +905,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -894,7 +960,8 @@ class TestReconciler(unittest.TestCase):
         # listing_qs encodes and quotes - so give it name
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -951,7 +1018,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -997,7 +1065,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['noop_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -1022,7 +1091,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -1071,11 +1141,11 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
-             ('GET', '/v1/.misplaced_objects' + listing_qs(container)),
-             ('GET', '/v1/%s' % q_path + listing_qs('')),
+            [('GET', '/v1/%s' % q_path + listing_qs('')),
              ('GET', '/v1/%s' % q_path +
-              listing_qs('1:/AUTH_bob/c/o1'))])
+              listing_qs('1:/AUTH_bob/c/o1')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs(container))])
         self.assertEqual(
             self.fake_swift.storage_policy[0].calls,
             [('HEAD', '/v1/AUTH_bob/c/o1')])
@@ -1110,11 +1180,11 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
-             ('GET', '/v1/.misplaced_objects' + listing_qs(container)),
-             ('GET', '/v1/%s' % q_path + listing_qs('')),
+            [('GET', '/v1/%s' % q_path + listing_qs('')),
              ('GET', '/v1/%s' % q_path +
-              listing_qs('1:/AUTH_bob/c/o1'))])
+              listing_qs('1:/AUTH_bob/c/o1')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs(container))])
         self.assertEqual(
             self.fake_swift.storage_policy[0].calls,
             [('HEAD', '/v1/AUTH_bob/c/o1')])
@@ -1148,11 +1218,11 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
-             ('GET', '/v1/.misplaced_objects' + listing_qs(container)),
-             ('GET', '/v1/%s' % q_path + listing_qs('')),
+            [('GET', '/v1/%s' % q_path + listing_qs('')),
              ('GET', '/v1/%s' % q_path +
-              listing_qs('1:/AUTH_bob/c/o1'))])
+              listing_qs('1:/AUTH_bob/c/o1')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs(container))])
         self.assertEqual(
             self.fake_swift.storage_policy[0].calls,
             [('HEAD', '/v1/AUTH_bob/c/o1')])
@@ -1187,7 +1257,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -1223,8 +1294,7 @@ class TestReconciler(unittest.TestCase):
 
     def test_object_move_src_object_is_forever_gone(self):
         # oh boy, hate to be here - this is an oldy
-        q_ts = float(normalize_timestamp(time.time())) - \
-            self.reconciler.reclaim_age
+        q_ts = self.start_interval - self.reconciler.reclaim_age - 1
         self._mock_listing({
             (None, "/.misplaced_objects/3600/1:/AUTH_bob/c/o1"): q_ts,
         })
@@ -1235,7 +1305,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -1270,7 +1341,8 @@ class TestReconciler(unittest.TestCase):
         # we look for misplaced objects
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -1308,7 +1380,8 @@ class TestReconciler(unittest.TestCase):
         # we look for misplaced objects...
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('3600')),
              ('GET', '/v1/.misplaced_objects/3600' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/3600' +
@@ -1349,7 +1422,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('36000')),
              ('GET', '/v1/.misplaced_objects/36000' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/36000' +
@@ -1402,7 +1476,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('36000')),
              ('GET', '/v1/.misplaced_objects/36000' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/36000' +
@@ -1452,7 +1527,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(self.reconciler.stats['misplaced_object'], 1)
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs('36000')),
              ('GET', '/v1/.misplaced_objects/36000' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/36000' +
@@ -1493,11 +1569,11 @@ class TestReconciler(unittest.TestCase):
 
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
-             ('GET', '/v1/.misplaced_objects' + listing_qs(container)),
-             ('GET', '/v1/.misplaced_objects/%s' % container + listing_qs('')),
+            [('GET', '/v1/.misplaced_objects/%s' % container + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/%s' % container +
-              listing_qs('1:/AUTH_jeb/c/o1'))])
+              listing_qs('1:/AUTH_jeb/c/o1')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
+             ('GET', '/v1/.misplaced_objects' + listing_qs(container))])
         self.assertEqual(
             self.fake_swift.storage_policy[0].calls,
             [('HEAD', '/v1/AUTH_jeb/c/o1')],
@@ -1527,7 +1603,8 @@ class TestReconciler(unittest.TestCase):
 
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs(container)),
              ('GET', '/v1/.misplaced_objects/%s' % container + listing_qs('')),
              ('GET', '/v1/.misplaced_objects/%s' % container +
@@ -1561,7 +1638,8 @@ class TestReconciler(unittest.TestCase):
         self.assertEqual(deleted_container_entries, [])
         self.assertEqual(
             self.fake_swift.calls,
-            [('GET', '/v1/.misplaced_objects' + listing_qs('')),
+            [('GET', self.current_container_path),
+             ('GET', '/v1/.misplaced_objects' + listing_qs('')),
              ('GET', '/v1/.misplaced_objects' + listing_qs(container)),
              ('GET', '/v1/.misplaced_objects/%s' % container + listing_qs('')),
              ('DELETE', '/v1/.misplaced_objects/%s' % container),
@@ -1573,17 +1651,17 @@ class TestReconciler(unittest.TestCase):
 
     def test_iter_over_old_containers_in_reverse(self):
         step = reconciler.MISPLACED_OBJECTS_CONTAINER_DIVISOR
-        now = int(time.time())
+        now = self.start_interval
         containers = []
         for i in range(10):
-            container_ts = now - step * i
+            container_ts = int(now - step * i)
             container_name = str(container_ts // 3600 * 3600)
             containers.append(container_name)
         # add some old containers too
         now -= self.reconciler.reclaim_age
         old_containers = []
         for i in range(10):
-            container_ts = now - step * i
+            container_ts = int(now - step * i)
             container_name = str(container_ts // 3600 * 3600)
             old_containers.append(container_name)
         containers.sort()
@@ -1602,7 +1680,7 @@ class TestReconciler(unittest.TestCase):
         new_container_calls = [
             ('GET', '/v1/.misplaced_objects/%s' % container +
              listing_qs('')) for container in reversed(containers)
-        ]
+        ][1:]  # current_container get's skipped the second time around...
         old_container_listings = [
             ('GET', '/v1/.misplaced_objects/%s' % container +
              listing_qs('')) for container in reversed(old_containers)
@@ -1613,8 +1691,10 @@ class TestReconciler(unittest.TestCase):
         ]
         old_container_calls = list(itertools.chain(*zip(
             old_container_listings, old_container_deletes)))
-        self.assertEqual(self.fake_swift.calls, account_listing_calls +
-                         new_container_calls + old_container_calls)
+        self.assertEqual(self.fake_swift.calls,
+                         [('GET', self.current_container_path)] +
+                         account_listing_calls + new_container_calls +
+                         old_container_calls)
 
 
 if __name__ == '__main__':
