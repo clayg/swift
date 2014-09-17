@@ -18,6 +18,7 @@
 
 import cPickle as pickle
 import datetime
+import json
 import errno
 import operator
 import os
@@ -39,17 +40,19 @@ from eventlet.green import httplib
 from nose import SkipTest
 
 from swift import __version__ as swift_version
+from swift.common.http import is_success
 from test.unit import FakeLogger, debug_logger, mocked_http_conn
 from test.unit import connect_tcp, readuntil2crlfs, patch_policies
 from swift.obj import server as object_server
 from swift.obj import diskfile
-from swift.common import utils, storage_policy, bufferedhttp
+from swift.common import utils, bufferedhttp
 from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
     NullLogger, storage_directory, public, replication
 from swift.common import constraints
-from swift.common.swob import Request, HeaderKeyDict
+from swift.common.swob import Request, HeaderKeyDict, WsgiStringIO
 from swift.common.splice import splice
-from swift.common.storage_policy import POLICIES
+from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
+                                         POLICIES, EC_POLICY)
 from swift.common.exceptions import DiskFileDeviceUnavailable
 
 
@@ -57,7 +60,14 @@ def mock_time(*args, **kwargs):
     return 5000.0
 
 
-@patch_policies
+test_policies = [
+    StoragePolicy(0, name='zero', is_default=True),
+    ECStoragePolicy(1, name='one', ec_type='jerasure_rs_vand',
+                    ec_ndata=10, ec_nparity=4),
+]
+
+
+@patch_policies(test_policies)
 class TestObjectController(unittest.TestCase):
     """Test swift.obj.server.ObjectController"""
 
@@ -731,6 +741,232 @@ class TestObjectController(unittest.TestCase):
                            'X-Object-Meta-1': 'One',
                            'X-Object-Meta-Two': 'Two'})
 
+    def test_PUT_etag_in_footer(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Transfer-Encoding': 'chunked',
+                     'X-Backend-Obj-Metadata-Footer': 'yes',
+                     'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
+            environ={'REQUEST_METHOD': 'PUT'})
+
+        footer_meta = json.dumps({"Etag": md5("obj data").hexdigest()})
+        footer_meta_cksum = md5(footer_meta).hexdigest()
+
+        req.body = "\r\n".join((
+            "--boundary",
+            "",
+            "obj data",
+            "--boundary",
+            "Content-MD5: " + footer_meta_cksum,
+            "",
+            footer_meta,
+            "--boundary--",
+        ))
+        req.headers.pop("Content-Length", None)
+
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        objfile = os.path.join(
+            self.testdir, 'sda1',
+            storage_directory(diskfile.get_data_dir(POLICIES[0]), 'p',
+                              hash_path('a', 'c', 'o')),
+            utils.Timestamp(timestamp).internal + '.data')
+        with open(objfile) as fh:
+            self.assertEqual(fh.read(), "obj data")
+
+    def test_PUT_etag_in_footer_mismatch(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Transfer-Encoding': 'chunked',
+                     'X-Backend-Obj-Metadata-Footer': 'yes',
+                     'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
+            environ={'REQUEST_METHOD': 'PUT'})
+
+        footer_meta = json.dumps({"Etag": md5("green").hexdigest()})
+        footer_meta_cksum = md5(footer_meta).hexdigest()
+
+        req.body = "\r\n".join((
+            "--boundary",
+            "",
+            "blue",
+            "--boundary",
+            "Content-MD5: " + footer_meta_cksum,
+            "",
+            footer_meta,
+            "--boundary--",
+        ))
+        req.headers.pop("Content-Length", None)
+
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 422)
+
+    def test_PUT_user_meta_in_footer(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Transfer-Encoding': 'chunked',
+                     'X-Backend-Obj-Metadata-Footer': 'yes',
+                     'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
+            environ={'REQUEST_METHOD': 'PUT'})
+
+        footer_meta = json.dumps({'X-Object-Meta-X': 'Y'})
+        footer_meta_cksum = md5(footer_meta).hexdigest()
+
+        req.body = "\r\n".join((
+            "--boundary",
+            "",
+            "stuff stuff stuff",
+            "--boundary",
+            "Content-MD5: " + footer_meta_cksum,
+            "",
+            footer_meta,
+            "--boundary--",
+        ))
+        req.headers.pop("Content-Length", None)
+
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            headers={'X-Timestamp': timestamp},
+            environ={'REQUEST_METHOD': 'HEAD'})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.headers.get('X-Object-Meta-X'), 'Y')
+
+    def test_PUT_missing_footer_checksum(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Transfer-Encoding': 'chunked',
+                     'X-Backend-Obj-Metadata-Footer': 'yes',
+                     'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
+            environ={'REQUEST_METHOD': 'PUT'})
+
+        footer_meta = json.dumps({"Etag": md5("obj data").hexdigest()})
+
+        req.body = "\r\n".join((
+            "--boundary",
+            "",
+            "obj data",
+            "--boundary",
+            # no Content-MD5
+            "",
+            footer_meta,
+            "--boundary--",
+        ))
+        req.headers.pop("Content-Length", None)
+
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+
+    def test_PUT_bad_footer_checksum(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Transfer-Encoding': 'chunked',
+                     'X-Backend-Obj-Metadata-Footer': 'yes',
+                     'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
+            environ={'REQUEST_METHOD': 'PUT'})
+
+        footer_meta = json.dumps({"Etag": md5("obj data").hexdigest()})
+        bad_footer_meta_cksum = md5(footer_meta + "bad").hexdigest()
+
+        req.body = "\r\n".join((
+            "--boundary",
+            "",
+            "obj data",
+            "--boundary",
+            "Content-MD5: " + bad_footer_meta_cksum,
+            "",
+            footer_meta,
+            "--boundary--",
+        ))
+        req.headers.pop("Content-Length", None)
+
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 422)
+
+    def test_PUT_bad_footer_json(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Transfer-Encoding': 'chunked',
+                     'X-Backend-Obj-Metadata-Footer': 'yes',
+                     'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
+            environ={'REQUEST_METHOD': 'PUT'})
+
+        footer_meta = "{{{[[{{[{[[{[{[[{{{[{{{{[[{{[{["
+        footer_meta_cksum = md5(footer_meta).hexdigest()
+
+        req.body = "\r\n".join((
+            "--boundary",
+            "",
+            "obj data",
+            "--boundary",
+            "Content-MD5: " + footer_meta_cksum,
+            "",
+            footer_meta,
+            "--boundary--",
+        ))
+        req.headers.pop("Content-Length", None)
+
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 400)
+
+    def test_PUT_extra_mime_docs_ignored(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Transfer-Encoding': 'chunked',
+                     'X-Backend-Obj-Metadata-Footer': 'yes',
+                     'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
+            environ={'REQUEST_METHOD': 'PUT'})
+
+        footer_meta = json.dumps({'X-Object-Meta-Mint': 'pepper'})
+        footer_meta_cksum = md5(footer_meta).hexdigest()
+
+        req.body = "\r\n".join((
+            "--boundary",
+            "",
+            "obj data",
+            "--boundary",
+            "Content-MD5: " + footer_meta_cksum,
+            "",
+            footer_meta,
+            "--boundary",
+            "This-Document-Is-Useless: yes",
+            "",
+            "blah blah I take up space",
+            "--boundary--"
+        ))
+        req.headers.pop("Content-Length", None)
+
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # swob made this into a StringIO for us
+        wsgi_input = req.environ['wsgi.input']
+        self.assertEqual(wsgi_input.tell(), len(wsgi_input.getvalue()))
+
     def test_PUT_user_metadata_no_xattr(self):
         timestamp = normalize_timestamp(time())
         req = Request.blank(
@@ -770,7 +1006,7 @@ class TestObjectController(unittest.TestCase):
                 headers={'X-Timestamp': timestamp,
                          'Content-Type': 'text/plain',
                          'Content-Length': '6'})
-            req.environ['wsgi.input'] = StringIO('VERIFY')
+            req.environ['wsgi.input'] = WsgiStringIO('VERIFY')
             resp = req.get_response(self.object_controller)
             self.assertEquals(resp.status_int, 408)
 
@@ -1018,6 +1254,40 @@ class TestObjectController(unittest.TestCase):
             self.assertEquals(resp.status_int, 201)
         finally:
             object_server.http_connect = old_http_connect
+
+    def test_PUT_durable_files(self):
+        for policy in POLICIES:
+            timestamp = utils.Timestamp(int(time())).internal
+            data_file_tail = '.data'
+            headers = {'X-Timestamp': timestamp,
+                       'Content-Length': '6',
+                       'Content-Type': 'application/octet-stream',
+                       'X-Backend-Storage-Policy-Index': int(policy)}
+            if policy.policy_type == EC_POLICY:
+                headers['X-Object-Sysmeta-Ec-Archive-Index'] = '2'
+                data_file_tail = '#2.data'
+            req = Request.blank(
+                '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                headers=headers)
+            req.body = 'VERIFY'
+            resp = req.get_response(self.object_controller)
+
+            self.assertEquals(resp.status_int, 201)
+            obj_dir = os.path.join(
+                self.testdir, 'sda1',
+                storage_directory(diskfile.get_data_dir(int(policy)),
+                                  'p', hash_path('a', 'c', 'o')))
+            data_file = os.path.join(obj_dir, timestamp) + data_file_tail
+            self.assertTrue(os.path.isfile(data_file),
+                            'Expected file %r not found in %r for policy %r'
+                            % (data_file, os.listdir(obj_dir), int(policy)))
+            durable_file = os.path.join(obj_dir, timestamp) + '.durable'
+            if policy.policy_type == EC_POLICY:
+                self.assertTrue(os.path.isfile(durable_file))
+                self.assertFalse(os.path.getsize(durable_file))
+            else:
+                self.assertFalse(os.path.isfile(durable_file))
+            rmtree(obj_dir)
 
     def test_HEAD(self):
         # Test swift.obj.server.ObjectController.HEAD
@@ -2189,7 +2459,7 @@ class TestObjectController(unittest.TestCase):
 
     def test_call_bad_request(self):
         # Test swift.obj.server.ObjectController.__call__
-        inbuf = StringIO()
+        inbuf = WsgiStringIO()
         errbuf = StringIO()
         outbuf = StringIO()
 
@@ -2216,7 +2486,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEquals(outbuf.getvalue()[:4], '400 ')
 
     def test_call_not_found(self):
-        inbuf = StringIO()
+        inbuf = WsgiStringIO()
         errbuf = StringIO()
         outbuf = StringIO()
 
@@ -2243,7 +2513,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEquals(outbuf.getvalue()[:4], '404 ')
 
     def test_call_bad_method(self):
-        inbuf = StringIO()
+        inbuf = WsgiStringIO()
         errbuf = StringIO()
         outbuf = StringIO()
 
@@ -2279,7 +2549,7 @@ class TestObjectController(unittest.TestCase):
         with mock.patch("swift.obj.diskfile.hash_path", my_hash_path):
             with mock.patch("swift.obj.server.check_object_creation",
                             my_check):
-                inbuf = StringIO()
+                inbuf = WsgiStringIO()
                 errbuf = StringIO()
                 outbuf = StringIO()
 
@@ -2308,7 +2578,7 @@ class TestObjectController(unittest.TestCase):
                 self.assertEquals(errbuf.getvalue(), '')
                 self.assertEquals(outbuf.getvalue()[:4], '201 ')
 
-                inbuf = StringIO()
+                inbuf = WsgiStringIO()
                 errbuf = StringIO()
                 outbuf = StringIO()
 
@@ -2459,6 +2729,9 @@ class TestObjectController(unittest.TestCase):
                     return ' '
                 return ''
 
+            def set_hundred_continue_response_headers(*a, **kw):
+                pass
+
         req = Request.blank(
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'PUT', 'wsgi.input': SlowBody()},
@@ -2487,6 +2760,9 @@ class TestObjectController(unittest.TestCase):
                     self.sent = True
                     return '   '
                 return ''
+
+            def set_hundred_continue_response_headers(*a, **kw):
+                pass
 
         req = Request.blank(
             '/sda1/p/a/c/o',
@@ -2570,10 +2846,13 @@ class TestObjectController(unittest.TestCase):
                 'user-agent': 'object-server %s' % os.getpid(),
                 'X-Backend-Storage-Policy-Index': int(policy)}])
 
-    @patch_policies([storage_policy.StoragePolicy(0, 'zero', True),
-                     storage_policy.StoragePolicy(1, 'one'),
-                     storage_policy.StoragePolicy(37, 'fantastico')])
+    @patch_policies([StoragePolicy(0, 'zero', True),
+                     StoragePolicy(1, 'one'),
+                     StoragePolicy(37, 'fantastico')])
     def test_updating_multiple_delete_at_container_servers(self):
+        # update router post patch
+        self.object_controller._diskfile_router = diskfile.DiskFileRouter(
+            self.conf, self.object_controller.logger)
         policy = random.choice(list(POLICIES))
         self.object_controller.expiring_objects_account = 'exp'
         self.object_controller.expiring_objects_container_divisor = 60
@@ -2689,10 +2968,13 @@ class TestObjectController(unittest.TestCase):
                  'X-Backend-Storage-Policy-Index': 0,
                  'x-trans-id': '-'})})
 
-    @patch_policies([storage_policy.StoragePolicy(0, 'zero', True),
-                     storage_policy.StoragePolicy(1, 'one'),
-                     storage_policy.StoragePolicy(26, 'twice-thirteen')])
+    @patch_policies([StoragePolicy(0, 'zero', True),
+                     StoragePolicy(1, 'one'),
+                     StoragePolicy(26, 'twice-thirteen')])
     def test_updating_multiple_container_servers(self):
+        # update router post patch
+        self.object_controller._diskfile_router = diskfile.DiskFileRouter(
+            self.conf, self.object_controller.logger)
         http_connect_args = []
 
         def fake_http_connect(ipaddr, port, device, partition, method, path,
@@ -2805,6 +3087,8 @@ class TestObjectController(unittest.TestCase):
             'X-Delete-At-Host': '10.0.0.2:6002',
             'X-Delete-At-Device': 'sda1',
             'X-Backend-Storage-Policy-Index': int(policy)}
+        if policy.policy_type == EC_POLICY:
+            headers['X-Object-Sysmeta-Ec-Archive-Index'] = '2'
         req = Request.blank(
             '/sda1/p/a/c/o', method='PUT', body='', headers=headers)
         with mocked_http_conn(
@@ -3118,8 +3402,8 @@ class TestObjectController(unittest.TestCase):
 
         def fake_pickle_async_update(*args):
             given_args[:] = args
-        self.object_controller._diskfile_mgr.pickle_async_update = \
-            fake_pickle_async_update
+        diskfile_mgr = self.object_controller._diskfile_router[POLICIES.legacy]
+        diskfile_mgr.pickle_async_update = fake_pickle_async_update
         with mocked_http_conn(500) as fake_conn:
             resp = req.get_response(self.object_controller)
             self.assertRaises(StopIteration, fake_conn.code_iter.next)
@@ -4130,7 +4414,7 @@ class TestObjectController(unittest.TestCase):
     def test_correct_allowed_method(self):
         # Test correct work for allowed method using
         # swift.obj.server.ObjectController.__call__
-        inbuf = StringIO()
+        inbuf = WsgiStringIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.object_controller = object_server.app_factory(
@@ -4168,7 +4452,7 @@ class TestObjectController(unittest.TestCase):
     def test_not_allowed_method(self):
         # Test correct work for NOT allowed method using
         # swift.obj.server.ObjectController.__call__
-        inbuf = StringIO()
+        inbuf = WsgiStringIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.object_controller = object_server.ObjectController(
@@ -4252,7 +4536,7 @@ class TestObjectController(unittest.TestCase):
             self.assertEquals(outbuf.getvalue()[:4], '405 ')
 
     def test_not_utf8_and_not_logging_requests(self):
-        inbuf = StringIO()
+        inbuf = WsgiStringIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.object_controller = object_server.ObjectController(
@@ -4291,7 +4575,7 @@ class TestObjectController(unittest.TestCase):
                              [])
 
     def test__call__returns_500(self):
-        inbuf = StringIO()
+        inbuf = WsgiStringIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.logger = debug_logger('test')
@@ -4337,7 +4621,7 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(self.logger.get_lines_for_level('info'), [])
 
     def test_PUT_slow(self):
-        inbuf = StringIO()
+        inbuf = WsgiStringIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.object_controller = object_server.ObjectController(
@@ -4398,9 +4682,12 @@ class TestObjectController(unittest.TestCase):
             [(('1.2.3.4 - - [01/Jan/1970:02:46:41 +0000] "HEAD /sda1/p/a/c/o" '
              '404 - "-" "-" "-" 2.0000 "-" 1234 -',), {})])
 
-    @patch_policies([storage_policy.StoragePolicy(0, 'zero', True),
-                     storage_policy.StoragePolicy(1, 'one', False)])
+    @patch_policies([StoragePolicy(0, 'zero', True),
+                     StoragePolicy(1, 'one', False)])
     def test_dynamic_datadir(self):
+        # update router post patch
+        self.object_controller._diskfile_router = diskfile.DiskFileRouter(
+            self.conf, self.object_controller.logger)
         timestamp = normalize_timestamp(time())
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'X-Timestamp': timestamp,
@@ -4434,8 +4721,54 @@ class TestObjectController(unittest.TestCase):
         self.assertEquals(resp.status_int, 201)
         self.assertTrue(os.path.isdir(object_dir))
 
+    def test_storage_policy_index_is_validated(self):
+        # sanity check that index for existing policy is ok
+        ts = (utils.Timestamp(t).internal for t in
+              itertools.count(int(time())))
+        methods = ('PUT', 'POST', 'GET', 'HEAD', 'REPLICATE', 'DELETE')
+        valid_indices = sorted([int(policy) for policy in POLICIES])
+        for index in valid_indices:
+            object_dir = self.testdir + "/sda1/objects"
+            if index > 0:
+                object_dir = "%s-%s" % (object_dir, index)
+            self.assertFalse(os.path.isdir(object_dir))
+            for method in methods:
+                headers = {
+                    'X-Timestamp': ts.next(),
+                    'Content-Type': 'application/x-test',
+                    'X-Backend-Storage-Policy-Index': index}
+                if POLICIES[index].policy_type == EC_POLICY:
+                    headers['X-Object-Sysmeta-Ec-Archive-Index'] = '2'
+                req = Request.blank(
+                    '/sda1/p/a/c/o',
+                    environ={'REQUEST_METHOD': method},
+                    headers=headers)
+                req.body = 'VERIFY'
+                resp = req.get_response(self.object_controller)
+                self.assertTrue(is_success(resp.status_int),
+                                '%s method failed: %r' % (method, resp.status))
+            self.assertTrue(os.path.isdir(object_dir),
+                            'Expected dir %r not found for %r with index=%r'
+                            % (object_dir, method, index))
+            rmtree(object_dir)
 
-@patch_policies
+        # index for non-existent policy should return 503
+        index = valid_indices[-1] + 1
+        for method in methods:
+            req = Request.blank('/sda1/p/a/c/o',
+                                environ={'REQUEST_METHOD': method},
+                                headers={
+                                    'X-Timestamp': ts.next(),
+                                    'Content-Type': 'application/x-test',
+                                    'X-Backend-Storage-Policy-Index': index})
+            req.body = 'VERIFY'
+            object_dir = self.testdir + "/sda1/objects-%s" % index
+            resp = req.get_response(self.object_controller)
+            self.assertEquals(resp.status_int, 503)
+            self.assertFalse(os.path.isdir(object_dir))
+
+
+@patch_policies(test_policies)
 class TestObjectServer(unittest.TestCase):
 
     def setUp(self):
@@ -4486,6 +4819,23 @@ class TestObjectServer(unittest.TestCase):
         resp.read()
         resp.close()
 
+    def test_expect_on_put_footer(self):
+        test_body = 'test'
+        headers = {
+            'Expect': '100-continue',
+            'Content-Length': len(test_body),
+            'X-Timestamp': utils.Timestamp(time()).internal,
+            'X-Backend-Obj-Metadata-Footer': 'yes',
+            'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary123',
+        }
+        conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
+                                         'PUT', '/a/c/o', headers=headers)
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+        headers = HeaderKeyDict(resp.getheaders())
+        self.assertEqual(headers['X-Obj-Metadata-Footer'], 'yes')
+        resp.close()
+
     def test_expect_on_put_conflict(self):
         test_body = 'test'
         put_timestamp = utils.Timestamp(time())
@@ -4513,6 +4863,290 @@ class TestObjectServer(unittest.TestCase):
         self.assertEqual(headers['X-Backend-Timestamp'], put_timestamp)
         resp.read()
         resp.close()
+
+    def test_multiphase_put_no_mime_boundary(self):
+        test_data = 'obj data'
+        put_timestamp = utils.Timestamp(time()).internal
+        headers = {
+            'Content-Type': 'text/plain',
+            'X-Timestamp': put_timestamp,
+            'Transfer-Encoding': 'chunked',
+            'Expect': '100-continue',
+            'X-Backend-Obj-Content-Length': len(test_data),
+            'X-Backend-Obj-Multiphase-Commit': 'yes',
+        }
+        conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
+                                         'PUT', '/a/c/o', headers=headers)
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 400)
+        resp.read()
+        resp.close()
+
+    def test_expect_on_multiphase_put(self):
+        test_data = 'obj data'
+        test_doc = "\r\n".join((
+            "--boundary123",
+            "X-Document: object body",
+            "",
+            test_data,
+            "--boundary123",
+        ))
+
+        put_timestamp = utils.Timestamp(time()).internal
+        headers = {
+            'Content-Type': 'text/plain',
+            'X-Timestamp': put_timestamp,
+            'Transfer-Encoding': 'chunked',
+            'Expect': '100-continue',
+            'X-Backend-Obj-Content-Length': len(test_data),
+            'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary123',
+            'X-Backend-Obj-Multiphase-Commit': 'yes',
+        }
+        conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
+                                         'PUT', '/a/c/o', headers=headers)
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+        headers = HeaderKeyDict(resp.getheaders())
+        self.assertEqual(headers['X-Obj-Multiphase-Commit'], 'yes')
+
+        to_send = "%x\r\n%s\r\n0\r\n\r\n" % (len(test_doc), test_doc)
+        conn.send(to_send)
+
+        # verify 100-continue response to mark end of phase1
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+        resp.close()
+
+    def test_multiphase_put_metadata_footer(self):
+        # Test 2-phase commit conversation - end of 1st phase marked
+        # by 100-continue response from the object server, with a
+        # successful 2nd phase marked by the presence of a .durable
+        # file along with .data file in the object data directory
+        test_data = 'obj data'
+        footer_meta = {
+            "X-Object-Sysmeta-Ec-Archive-Index": "2",
+            "Etag": md5(test_data).hexdigest(),
+        }
+        footer_json = json.dumps(footer_meta)
+        footer_meta_cksum = md5(footer_json).hexdigest()
+        test_doc = "\r\n".join((
+            "--boundary123",
+            "X-Document: object body",
+            "",
+            test_data,
+            "--boundary123",
+            "X-Document: object metadata",
+            "Content-MD5: " + footer_meta_cksum,
+            "",
+            footer_json,
+            "--boundary123",
+        ))
+
+        # phase1 - PUT request with object metadata in footer and
+        # multiphase commit conversation
+        put_timestamp = utils.Timestamp(time()).internal
+        headers = {
+            'Content-Type': 'text/plain',
+            'X-Timestamp': put_timestamp,
+            'Transfer-Encoding': 'chunked',
+            'Expect': '100-continue',
+            'X-Backend-Storage-Policy-Index': '1',
+            'X-Backend-Obj-Content-Length': len(test_data),
+            'X-Backend-Obj-Metadata-Footer': 'yes',
+            'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary123',
+            'X-Backend-Obj-Multiphase-Commit': 'yes',
+        }
+        conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
+                                         'PUT', '/a/c/o', headers=headers)
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+        headers = HeaderKeyDict(resp.getheaders())
+        self.assertEqual(headers['X-Obj-Multiphase-Commit'], 'yes')
+        self.assertEqual(headers['X-Obj-Metadata-Footer'], 'yes')
+
+        to_send = "%x\r\n%s\r\n0\r\n\r\n" % (len(test_doc), test_doc)
+        conn.send(to_send)
+        # verify 100-continue response to mark end of phase1
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+
+        # send commit confirmation to start phase2
+        commit_confirmation_doc = "\r\n".join((
+            "X-Document: put commit",
+            "",
+            "commit_confirmation",
+            "--boundary123--",
+        ))
+        to_send = "%x\r\n%s\r\n0\r\n\r\n" % \
+            (len(commit_confirmation_doc), commit_confirmation_doc)
+        conn.send(to_send)
+
+        # verify success (2xx) to make end of phase2
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 201)
+        resp.read()
+        resp.close()
+
+        # verify successful object data and durable state file write
+        obj_basename = os.path.join(
+            self.devices, 'sda1',
+            storage_directory(diskfile.get_data_dir(POLICIES[1]), '0',
+                              hash_path('a', 'c', 'o')),
+            put_timestamp)
+        obj_datafile = obj_basename + '#2.data'
+        self.assert_(os.path.isfile(obj_datafile))
+        obj_durablefile = obj_basename + '.durable'
+        self.assert_(os.path.isfile(obj_durablefile))
+
+    def test_multiphase_put_no_metadata_footer(self):
+        # Test 2-phase commit conversation, with no metadata footer
+        # at the end of object data - end of 1st phase marked
+        # by 100-continue response from the object server, with a
+        # successful 2nd phase marked by the presence of a .durable
+        # file along with .data file in the object data directory
+        # (No metadata footer case)
+        test_data = 'obj data'
+        test_doc = "\r\n".join((
+            "--boundary123",
+            "X-Document: object body",
+            "",
+            test_data,
+            "--boundary123",
+        ))
+
+        # phase1 - PUT request with multiphase commit conversation
+        # no object metadata in footer
+        put_timestamp = utils.Timestamp(time()).internal
+        headers = {
+            'Content-Type': 'text/plain',
+            'X-Timestamp': put_timestamp,
+            'Transfer-Encoding': 'chunked',
+            'Expect': '100-continue',
+            # normally the frag index gets sent in the MIME footer (which this
+            # test doesn't have, see `test_multiphase_put_metadata_footer`),
+            # but the proxy *could* send the frag index in the headers and
+            # this test verifies that would work.
+            'X-Object-Sysmeta-Ec-Archive-Index': '2',
+            'X-Backend-Storage-Policy-Index': '1',
+            'X-Backend-Obj-Content-Length': len(test_data),
+            'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary123',
+            'X-Backend-Obj-Multiphase-Commit': 'yes',
+        }
+        conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
+                                         'PUT', '/a/c/o', headers=headers)
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+        headers = HeaderKeyDict(resp.getheaders())
+        self.assertEqual(headers['X-Obj-Multiphase-Commit'], 'yes')
+
+        to_send = "%x\r\n%s\r\n0\r\n\r\n" % (len(test_doc), test_doc)
+        conn.send(to_send)
+        # verify 100-continue response to mark end of phase1
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+
+        # send commit confirmation to start phase2
+        commit_confirmation_doc = "\r\n".join((
+            "X-Document: put commit",
+            "",
+            "commit_confirmation",
+            "--boundary123--",
+        ))
+        to_send = "%x\r\n%s\r\n0\r\n\r\n" % \
+            (len(commit_confirmation_doc), commit_confirmation_doc)
+        conn.send(to_send)
+
+        # verify success (2xx) to make end of phase2
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 201)
+        resp.read()
+        resp.close()
+
+        # verify successful object data and durable state file write
+        obj_basename = os.path.join(
+            self.devices, 'sda1',
+            storage_directory(diskfile.get_data_dir(POLICIES[1]), '0',
+                              hash_path('a', 'c', 'o')),
+            put_timestamp)
+        obj_datafile = obj_basename + '#2.data'
+        self.assert_(os.path.isfile(obj_datafile))
+        obj_durablefile = obj_basename + '.durable'
+        self.assert_(os.path.isfile(obj_durablefile))
+
+    def test_multiphase_put_bad_commit_message(self):
+        # Test 2-phase commit conversation - end of 1st phase marked
+        # by 100-continue response from the object server, with 2nd
+        # phase commit confirmation being received corrupt
+        test_data = 'obj data'
+        footer_meta = {
+            "X-Object-Sysmeta-Ec-Archive-Index": "7",
+            "Etag": md5(test_data).hexdigest(),
+        }
+        footer_json = json.dumps(footer_meta)
+        footer_meta_cksum = md5(footer_json).hexdigest()
+        test_doc = "\r\n".join((
+            "--boundary123",
+            "X-Document: object body",
+            "",
+            test_data,
+            "--boundary123",
+            "X-Document: object metadata",
+            "Content-MD5: " + footer_meta_cksum,
+            "",
+            footer_json,
+            "--boundary123",
+        ))
+
+        # phase1 - PUT request with object metadata in footer and
+        # multiphase commit conversation
+        put_timestamp = utils.Timestamp(time()).internal
+        headers = {
+            'Content-Type': 'text/plain',
+            'X-Timestamp': put_timestamp,
+            'Transfer-Encoding': 'chunked',
+            'Expect': '100-continue',
+            'X-Backend-Storage-Policy-Index': '1',
+            'X-Backend-Obj-Content-Length': len(test_data),
+            'X-Backend-Obj-Metadata-Footer': 'yes',
+            'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary123',
+            'X-Backend-Obj-Multiphase-Commit': 'yes',
+        }
+        conn = bufferedhttp.http_connect('127.0.0.1', self.port, 'sda1', '0',
+                                         'PUT', '/a/c/o', headers=headers)
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+        headers = HeaderKeyDict(resp.getheaders())
+        self.assertEqual(headers['X-Obj-Multiphase-Commit'], 'yes')
+        self.assertEqual(headers['X-Obj-Metadata-Footer'], 'yes')
+
+        to_send = "%x\r\n%s\r\n0\r\n\r\n" % (len(test_doc), test_doc)
+        conn.send(to_send)
+        # verify 100-continue response to mark end of phase1
+        resp = conn.getexpect()
+        self.assertEqual(resp.status, 100)
+
+        # send commit confirmation to start phase2
+        commit_confirmation_doc = "\r\n".join((
+            "junkjunk",
+            "--boundary123--",
+        ))
+        to_send = "%x\r\n%s\r\n0\r\n\r\n" % \
+            (len(commit_confirmation_doc), commit_confirmation_doc)
+        conn.send(to_send)
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 500)
+        resp.read()
+        resp.close()
+        # verify that durable file was NOT created
+        obj_basename = os.path.join(
+            self.devices, 'sda1',
+            storage_directory(diskfile.get_data_dir(1), '0',
+                              hash_path('a', 'c', 'o')),
+            put_timestamp)
+        obj_datafile = obj_basename + '#7.data'
+        self.assert_(os.path.isfile(obj_datafile))
+        obj_durablefile = obj_basename + '.durable'
+        self.assertFalse(os.path.isfile(obj_durablefile))
 
 
 @patch_policies
