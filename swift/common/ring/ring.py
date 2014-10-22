@@ -243,7 +243,7 @@ class Ring(object):
                 if dev_id not in seen_ids:
                     part_nodes.append(self.devs[dev_id])
                     seen_ids.add(dev_id)
-        return part_nodes
+        return [dict(node, index=i) for i, node in enumerate(part_nodes)]
 
     def get_part(self, account, container=None, obj=None):
         """

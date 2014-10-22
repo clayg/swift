@@ -221,7 +221,7 @@ class FakeRing(Ring):
         return self.replicas
 
     def _get_part_nodes(self, part):
-        return list(self._devs)
+        return [dict(node, index=i) for i, node in enumerate(list(self._devs))]
 
     def get_more_nodes(self, part):
         # replicas^2 is the true cap
