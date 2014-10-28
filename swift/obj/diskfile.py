@@ -720,7 +720,7 @@ class DiskFileManager(object):
         if not dev_path:
             raise DiskFileDeviceUnavailable()
         object_path = os.path.join(
-            dev_path, get_data_dir(policy), partition, object_hash[-3:],
+            dev_path, get_data_dir(policy), str(partition), object_hash[-3:],
             object_hash)
         try:
             filenames = self.hash_cleanup_listdir(object_path,
@@ -809,7 +809,7 @@ class DiskFileManager(object):
         else:
             partition_path = os.path.join(dev_path,
                                           get_data_dir(policy),
-                                          partition)
+                                          str(partition))
             suffixes = (
                 (os.path.join(partition_path, suffix), suffix)
                 for suffix in suffixes)
@@ -1826,9 +1826,10 @@ class ECDiskFileWriter(DiskFileWriter):
         timestamp = Timestamp(metadata['X-Timestamp'])
         # generally we treat the fragment index provided in metadata as canon,
         # but if it's unavailable (e.g. tests) it's reasonable to use the
-        # frag_index provided at instantiation.
-        fi = metadata.get('X-Object-Sysmeta-Ec-Archive-Index',
-                          self._diskfile._frag_index)
+        # frag_index provided at instantiation. Either way make sure that the
+        # fragment index is included in object sysmeta.
+        fi = metadata.setdefault('X-Object-Sysmeta-Ec-Archive-Index',
+                                 self._diskfile._frag_index)
         filename = self.manager.make_on_disk_filename(
             timestamp, self._extension, frag_index=fi)
         metadata['name'] = self._name
@@ -1877,6 +1878,31 @@ class ECDiskFile(DiskFile):
                 files, self._datadir, frag_index=self._frag_index)
         return fileset
 
+    def purge(self, timestamp, frag_index):
+        """
+        Remove a data file matching the specified timestamp and fragment index
+        from the object directory, and if it is the only data file in the
+        directory then remove the .durable file too. Does not create a
+        tombstone file. Also cleans up any obsolete files.
+
+        This provides the EC reconstructor/ssync process with a way to remove a
+        fragment archive from a handoff node after reverting it to its primary
+        node.
+
+        :param timestamp: the object timestamp, an instance of
+                          :class:`~swift.common.utils.Timestamp`
+        :param frag_index: a fragment archive index, must be a whole number.
+        """
+        results = self.manager.cleanup_ondisk_files(self._datadir)
+        purged_data_file = self.manager.make_on_disk_filename(
+            timestamp, ext='.data', frag_index=frag_index)
+        fragments = results.get('fragments', [])
+        if purged_data_file in fragments:
+            fragments.remove(purged_data_file)
+            remove_file(os.path.join(self._datadir, purged_data_file))
+            if not fragments and '.durable' in results:
+                remove_file(os.path.join(self._datadir, results['.durable']))
+
 
 @DiskFileRouter.register(EC_POLICY)
 class ECDiskFileManager(DiskFileManager):
@@ -1906,6 +1932,8 @@ class ECDiskFileManager(DiskFileManager):
                           :class:`~swift.common.utils.Timestamp`
         :param ext: an optional string representing a file extension to be
                     appended to the returned file name
+        :param frag_index: a fragment archive index, used with .data extension
+                           only, must be a whole number.
         :returns: a file name
         :raises DiskFileError: if ext=='.data' and the kwarg frag_index is not
                                a whole number
@@ -2022,6 +2050,7 @@ class ECDiskFileManager(DiskFileManager):
                         accept_first()
                         set_valid_fileset()
                     # else: keep searching for a .data file to match frag_index
+                    context.setdefault('fragments', []).append(filename)
             else:
                 # there can no longer be a matching .data file so mark what has
                 # been found so far as the valid fileset
@@ -2206,7 +2235,7 @@ class ECDiskFileManager(DiskFileManager):
         else:
             partition_path = os.path.join(dev_path,
                                           get_data_dir(policy),
-                                          partition)
+                                          str(partition))
             suffixes = (
                 (os.path.join(partition_path, suffix), suffix)
                 for suffix in suffixes)

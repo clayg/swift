@@ -3198,6 +3198,9 @@ class TestECDiskFile(DiskFileMixin, unittest.TestCase):
             df = self._get_open_disk_file(ts=ts, policy=policy,
                                           frag_index=good_value)
             self.assertEqual(expected, sorted(os.listdir(df._datadir)))
+            # frag index should be added to object sysmeta
+            actual = df.get_metadata().get('X-Object-Sysmeta-Ec-Archive-Index')
+            self.assertEqual(int(good_value), int(actual))
 
             # metadata value overrides the constructor arg
             ts = self.ts().internal
@@ -3207,6 +3210,8 @@ class TestECDiskFile(DiskFileMixin, unittest.TestCase):
                                           frag_index='99',
                                           extra_metadata=meta)
             self.assertEqual(expected, sorted(os.listdir(df._datadir)))
+            actual = df.get_metadata().get('X-Object-Sysmeta-Ec-Archive-Index')
+            self.assertEqual(int(good_value), int(actual))
 
             # metadata value alone is sufficient
             ts = self.ts().internal
@@ -3216,6 +3221,8 @@ class TestECDiskFile(DiskFileMixin, unittest.TestCase):
                                           frag_index=None,
                                           extra_metadata=meta)
             self.assertEqual(expected, sorted(os.listdir(df._datadir)))
+            actual = df.get_metadata().get('X-Object-Sysmeta-Ec-Archive-Index')
+            self.assertEqual(int(good_value), int(actual))
 
     def test_data_file_errors_bad_frag_index(self):
         policy = POLICIES.default
