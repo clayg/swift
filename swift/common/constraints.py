@@ -51,7 +51,7 @@ DEFAULT_CONSTRAINTS = {
     'container_listing_limit': CONTAINER_LISTING_LIMIT,
     'account_listing_limit': ACCOUNT_LISTING_LIMIT,
     'max_account_name_length': MAX_ACCOUNT_NAME_LENGTH,
-    'max_container_name_length': MAX_CONTAINER_NAME_LENGTH,
+    'max_container_name_length': MAX_CONTAINER_NAME_LENGTH
 }
 
 SWIFT_CONSTRAINTS_LOADED = False
@@ -202,6 +202,19 @@ def check_object_creation(req, object_name):
         return HTTPBadRequest(request=req, body='Invalid Content-Type',
                               content_type='text/plain')
     return check_metadata(req, 'object')
+
+
+def check_dir(root, drive):
+    """
+    Verify that the path to the device is a directory and is a lesser
+    constraint that is enforced when a full mount_check isn't possible
+    with, for instance, a VM using loopback or partitions.
+
+    :param root:  base path where the dir is
+    :param drive: drive name to be checked
+    :returns: True if it is a valid directoy, False otherwise
+    """
+    return os.path.isdir(os.path.join(root, drive))
 
 
 def check_mount(root, drive):
