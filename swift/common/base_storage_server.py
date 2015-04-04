@@ -15,6 +15,7 @@
 
 import inspect
 from swift import __version__ as swift_version
+from swift.common.constraints import check_mount, check_dir
 from swift.common.utils import public, timing_stats, config_true_value
 from swift.common.swob import Response
 
@@ -35,6 +36,16 @@ class BaseStorageServer(object):
     def server_type(self):
         raise NotImplementedError(
             'Storage nodes have not implemented the Server type.')
+
+    def _mount_check(self, drive):
+        """
+        Validate the drive is mounted, or at least a valid directory.
+        """
+        if self.mount_check:
+            check = check_mount
+        else:
+            check = check_dir
+        return check(self.root, drive)
 
     @property
     def allowed_methods(self):

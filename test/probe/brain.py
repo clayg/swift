@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
+import os
 import sys
 import itertools
 import uuid
@@ -26,7 +28,7 @@ from swift.common.http import HTTP_NOT_FOUND
 
 from swiftclient import client, get_auth, ClientException
 
-from test.probe.common import ENABLED_POLICIES
+from test.probe.common import ENABLED_POLICIES, build_port_to_conf
 
 TIMEOUT = 60
 
@@ -88,6 +90,8 @@ class BrainSplitter(object):
             self.policy = None
             self.ring = ring.Ring(
                 '/etc/swift/%s.ring.gz' % server_type)
+            self.quorum = utils.quorum_size(self.ring.replica_count)
+            self.max_fail = (len(self.ring.devs) - self.quorum)
         elif server_type == 'object':
             if not policy:
                 raise TypeError('Object BrainSplitters need to '
@@ -95,19 +99,82 @@ class BrainSplitter(object):
             self.policy = policy
             policy.load_ring('/etc/swift')
             self.ring = policy.object_ring
+            self.quorum = policy.quorum
+            self.max_fail = (len(self.ring.devs) - self.quorum)
         else:
             raise ValueError('Unkonwn server_type: %r' % server_type)
         self.server_type = server_type
+        self.port_to_conf = build_port_to_conf(self.server_type)
 
-        part, nodes = self.ring.get_nodes(self.account, c, o)
+        self.part, self.nodes = self.ring.get_nodes(self.account, c, o)
 
-        node_ids = [n['id'] for n in nodes]
-        if all(n_id in node_ids for n_id in (0, 1)):
+        # this is so coupled with the saio setup it's not even funny
+        self.primary_nodes = self.nodes[:self.quorum]
+        primary_ids = [n['id'] for n in self.nodes]
+        self.handoff_nodes = [n for n in self.ring.devs
+                              if n['id'] not in primary_ids]
+
+        if all(n_id in primary_ids for n_id in (0, 1)):
             self.primary_numbers = (1, 2)
             self.handoff_numbers = (3, 4)
         else:
             self.primary_numbers = (3, 4)
             self.handoff_numbers = (1, 2)
+
+    def device_paths(self, node):
+        conf = self.port_to_conf[node['port']]
+        enabled_path = os.path.join(conf['devices'], node['device'])
+        disabled_path = os.path.join(conf['devices'],
+                                     '.' + node['device'])
+        return enabled_path, disabled_path
+
+    def disable_device(self, node):
+        enabled_path, disabled_path = self.device_paths(node)
+        try:
+            os.rename(enabled_path, disabled_path)
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                raise
+
+    def enable_device(self, node):
+        enabled_path, disabled_path = self.device_paths(node)
+        try:
+            os.rename(disabled_path, enabled_path)
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                raise
+
+    @command
+    def unmount_primary_half(self):
+        """
+        unmount devices 1, 2, [3]
+        """
+        for node in self.primary_nodes[:self.max_fail]:
+            self.disable_device(node)
+
+    @command
+    def mount_primary_half(self):
+        """
+        mount devices 1, 2, [3]
+        """
+        for node in self.primary_nodes[:self.max_fail]:
+            self.enable_device(node)
+
+    @command
+    def unmount_handoff_half(self):
+        """
+        unmount devices -1, -2, [-3]
+        """
+        for node in self.handoff_nodes[:self.max_fail]:
+            self.disable_device(node)
+
+    @command
+    def mount_handoff_half(self):
+        """
+        unmount devices -1, -2, [-3]
+        """
+        for node in self.handoff_nodes[:self.max_fail]:
+            self.enable_device(node)
 
     @command
     def start_primary_half(self):

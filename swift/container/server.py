@@ -32,7 +32,7 @@ from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, validate_sync_to, \
     config_true_value, json, timing_stats, replication, \
     override_bytes_from_content_type, get_log_line
-from swift.common.constraints import check_mount, valid_timestamp, check_utf8
+from swift.common.constraints import valid_timestamp, check_utf8
 from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout
@@ -244,7 +244,7 @@ class ContainerController(BaseStorageServer):
         drive, part, account, container, obj = split_and_validate_path(
             req, 4, 5, True)
         req_timestamp = valid_timestamp(req)
-        if self.mount_check and not check_mount(self.root, drive):
+        if not self._mount_check(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         # policy index is only relevant for delete_obj (and transitively for
         # auto create accounts)
@@ -331,7 +331,7 @@ class ContainerController(BaseStorageServer):
                 self.realms_conf)
             if err:
                 return HTTPBadRequest(err)
-        if self.mount_check and not check_mount(self.root, drive):
+        if not self._mount_check(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         requested_policy_index = self.get_and_validate_policy_index(req)
         broker = self._get_container_broker(drive, part, account, container)
@@ -395,7 +395,7 @@ class ContainerController(BaseStorageServer):
         drive, part, account, container, obj = split_and_validate_path(
             req, 4, 5, True)
         out_content_type = get_listing_content_type(req)
-        if self.mount_check and not check_mount(self.root, drive):
+        if not self._mount_check(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_container_broker(drive, part, account, container,
                                             pending_timeout=0.1,
@@ -456,7 +456,7 @@ class ContainerController(BaseStorageServer):
                     body='Maximum limit is %d'
                     % constraints.CONTAINER_LISTING_LIMIT)
         out_content_type = get_listing_content_type(req)
-        if self.mount_check and not check_mount(self.root, drive):
+        if not self._mount_check(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_container_broker(drive, part, account, container,
                                             pending_timeout=0.1,
@@ -517,7 +517,7 @@ class ContainerController(BaseStorageServer):
         """
         post_args = split_and_validate_path(req, 3)
         drive, partition, hash = post_args
-        if self.mount_check and not check_mount(self.root, drive):
+        if not self._mount_check(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         try:
             args = json.load(req.environ['wsgi.input'])
@@ -539,7 +539,7 @@ class ContainerController(BaseStorageServer):
                 self.realms_conf)
             if err:
                 return HTTPBadRequest(err)
-        if self.mount_check and not check_mount(self.root, drive):
+        if not self._mount_check(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_container_broker(drive, part, account, container)
         if broker.is_deleted():
