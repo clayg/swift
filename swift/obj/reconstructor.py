@@ -28,8 +28,7 @@ from eventlet.support.greenlets import GreenletExit
 from swift.common.utils import (
     whataremyips, unlink_older_than, compute_eta, get_logger,
     dump_recon_cache, ismount, mkdirs, config_true_value, list_from_csv,
-    get_hub, tpool_reraise, config_auto_int_value, GreenAsyncPile, Timestamp,
-    remove_file)
+    get_hub, tpool_reraise, GreenAsyncPile, Timestamp, remove_file)
 from swift.common.swob import HeaderKeyDict
 from swift.common.bufferedhttp import http_connect
 from swift.common.daemon import Daemon
@@ -39,7 +38,8 @@ from swift.common.http import HTTP_OK, HTTP_INSUFFICIENT_STORAGE
 from swift.obj.diskfile import DiskFileRouter, get_data_dir, \
     get_tmp_dir
 from swift.common.storage_policy import POLICIES, EC_POLICY
-from swift.common.exceptions import ConnectionTimeout, DiskFileError
+from swift.common.exceptions import (ConnectionTimeout, DiskFileError,
+                                     SuffixSyncError)
 
 SYNC, REVERT = ('sync_only', 'sync_revert')
 
@@ -107,7 +107,6 @@ class ObjectReconstructor(Daemon):
         self.stats_interval = int(conf.get('stats_interval', '300'))
         self.ring_check_interval = int(conf.get('ring_check_interval', 15))
         self.next_check = time.time() + self.ring_check_interval
-        # TODO:  related to cleanup of old files
         self.reclaim_age = int(conf.get('reclaim_age', 86400 * 7))
         self.partition_times = []
         self.run_pause = int(conf.get('run_pause', 30))
@@ -116,10 +115,9 @@ class ObjectReconstructor(Daemon):
         self.recon_cache_path = conf.get('recon_cache_path',
                                          '/var/cache/swift')
         self.rcache = os.path.join(self.recon_cache_path, "object.recon")
+        # defaults subject to change after beta
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.node_timeout = float(conf.get('node_timeout', 10))
-        # TODO:  review these chunk size defaults, probably want to go
-        # with 1MB at least
         self.network_chunk_size = int(conf.get('network_chunk_size', 65536))
         self.disk_chunk_size = int(conf.get('disk_chunk_size', 65536))
         self.headers = {
@@ -127,9 +125,6 @@ class ObjectReconstructor(Daemon):
             'user-agent': 'obj-reconstructor %s' % os.getpid()}
         self.handoffs_first = config_true_value(conf.get('handoffs_first',
                                                          False))
-        # TODO:  handoff_delete is not implemented
-        self.handoff_delete = config_auto_int_value(
-            conf.get('handoff_delete', 'auto'), 0)
         self._df_router = DiskFileRouter(conf, self.logger)
 
     def get_object_ring(self, policy_idx):
@@ -407,6 +402,19 @@ class ObjectReconstructor(Daemon):
 
     def get_suffix_delta(self, local_suff, local_index,
                          remote_suff, remote_index):
+        """
+        Compare the local suffix hashes with the remote suffix hashes
+        for the given local and remote fragment indexes.  Return those
+        suffixes which should be synced.
+
+        :param local_suff: the local suffix hashes (from tpool_get_info)
+        :param local_index: the local fragment index for the job
+        :param remote_suff: the remote suffix hashes (from remote
+                            REPLICATE request)
+        :param remote_index: the remote fragment index for the job
+
+        :returns: a list of strings, the suffix dirs to sync
+        """
         suffixes = []
         for suffix, sub_dict_local in local_suff.iteritems():
             sub_dict_remote = remote_suff.get(suffix, {})
@@ -416,16 +424,97 @@ class ObjectReconstructor(Daemon):
                 suffixes.append(suffix)
         return suffixes
 
+    def _get_suffixes_for_job(self, job, node):
+        """
+        For REVERT jobs this will just return the list of suffixes in
+        the local hash.
+
+        For SYNC jobs we need to make a remote REPLICATE request to get
+        the remote nodes current suffixes hashes and then compare to our
+        local suffixes hashes to decide which suffixes (if any) are out
+        of sync.
+
+        :param: the job dict, with the keys defined in ``_get_job_info``
+        :returns: a (possibly empty) list of strings, the suffixes to be
+                  synced with the remote node.
+        """
+        if job['sync_type'] == REVERT:
+            # REVERT jobs just sync all local suffixes to remote node
+            return job['hashes'].keys()
+
+        # get hashes from the remote node
+        remote_suffixes = None
+        try:
+            with Timeout(self.http_timeout):
+                resp = http_connect(
+                    node['replication_ip'], node['replication_port'],
+                    node['device'], job['partition'], 'REPLICATE',
+                    '', headers=self.headers).getresponse()
+            if resp.status == HTTP_INSUFFICIENT_STORAGE:
+                self.logger.error(
+                    _('%s responded as unmounted'),
+                    self._full_path(node, job['partition'], '',
+                                    job['policy']))
+            elif resp.status != HTTP_OK:
+                self.logger.error(
+                    _("Invalid response %(resp)s "
+                      "from %(full_path)s"), {
+                          'resp': resp.status,
+                          'full_path': self._full_path(
+                              node, job['partition'], '',
+                              job['policy'])
+                      })
+            else:
+                remote_suffixes = pickle.loads(resp.read())
+        except (Exception, Timeout):
+            # all exceptions are logged here so that our caller can
+            # safely catch our exception and continue to the next node
+            # without logging
+            self.logger.exception('Unable to get remote suffix hashes '
+                                  'from %r' % self._full_path(
+                                      node, job['partition'], '',
+                                      job['policy']))
+
+        if not remote_suffixes:
+            raise SuffixSyncError('Unable to get remote suffix hashes')
+
+        suffixes = self.get_suffix_delta(job['hashes'],
+                                         job['frag_index'],
+                                         remote_suffixes,
+                                         node['index'])
+        # now recalculate local hashes for suffixes that don't
+        # match so we're comparing the latest
+        local_suff = self.tpool_get_info(job['policy'],
+                                         job['path'],
+                                         recalculate=suffixes)
+
+        suffixes = self.get_suffix_delta(local_suff,
+                                         job['frag_index'],
+                                         remote_suffixes,
+                                         node['index'])
+        return suffixes
+
     def process_job(self, job):
         """
-        the reconstructor doesn't have the notion of update() and
-        update_deleted() like the replicator as it has to perform
-        sort of a blend of both of those operations, sometimes its
-        just sync'ing with its partners, sometimes its just
-        reverting a partition and sometimes its reverting individual
-        objects within a suffix dir to various primaries
+        Sync the local partition with the remote node(s) according to
+        the paramaters of the job.  For primary nodes, the SYNC job type
+        will define both left and right hand sync_to nodes to ssync with
+        as defined by this primary nodes index in the node list based on
+        the fragment index found in the partition.  For non-primary
+        nodes (either handoff revert, or rebalance) the REVERT job will
+        define a single node in sync_to which is the proper/new home for
+        the fragment index.
+
+        N.B. ring rebalancing is can be time consuming and handoff nodes
+        fragment indexes do not have a stable order, it's possible to
+        have more than one REVERT job for a partition, and in some rare
+        failure condititons there may even also be a SYNC job for the
+        same partition - but each one will be processed seperatly
+        because echo job will define a seperate list of node(s) to
+        'sync_to'.
+
+        :param: the job dict, with the keys defined in ``_get_job_info``
         """
-        self.logger.increment('partition.delete.count.%s' % (job['device'],))
         self.headers['X-Backend-Storage-Policy-Index'] = int(job['policy'])
         begin = time.time()
 
@@ -440,63 +529,27 @@ class ObjectReconstructor(Daemon):
             if syncd_with == len(job['sync_to']):
                 break
 
-            # get hashes from the remote node
             try:
-                with Timeout(self.http_timeout):
-                    resp = http_connect(
-                        node['replication_ip'], node['replication_port'],
-                        node['device'], job['partition'], 'REPLICATE',
-                        '', headers=self.headers).getresponse()
-                    if resp.status == HTTP_INSUFFICIENT_STORAGE:
-                        self.logger.error(
-                            _('%s responded as unmounted'),
-                            self._full_path(node, job['partition'], '',
-                                            job['policy']))
-                        continue
-                    syncd_with += 1
-                    if resp.status != HTTP_OK:
-                        self.logger.error(
-                            _("Invalid response %(resp)s "
-                              "from %(full_path)s"), {
-                                  'resp': resp.status,
-                                  'full_path': self._full_path(
-                                      node, job['partition'], '',
-                                      job['policy'])
-                              })
-                        continue
-                    remote_hash = pickle.loads(resp.read())
-                    del resp
+                suffixes = self._get_suffixes_for_job(job, node)
+            except SuffixSyncError:
+                continue
 
-                # for regular sync we compare suffixes, for revert
-                # we can't as another ECrecon may have already rebuilt the
-                # the remote and updated its hashes so instead we use
-                # the suffix list provided for us in the job
-                if job['sync_type'] == SYNC:
-                    suffixes = self.get_suffix_delta(job['hashes'],
-                                                     job['frag_index'],
-                                                     remote_hash,
-                                                     node['index'])
-                    if not suffixes:
-                        continue
+            if job['job_type'] == SYNC and not suffixes:
+                syncd_with += 1
+                continue
 
-                    # now recalculate local hashes for suffixes that don't
-                    # match so we're comparing the latest
-                    local_suff = self.tpool_get_info(job['policy'],
-                                                     job['path'],
-                                                     recalculate=suffixes)
-                    self.suffix_count += len(local_suff)
-                    suffixes = self.get_suffix_delta(local_suff,
-                                                     job['frag_index'],
-                                                     remote_hash,
-                                                     node['index'])
-                else:
-                    suffixes = job['hashes'].keys()
-                    if job['local_index'] != node['index']:
-                        # instruct ssync to delete reverted after ssync'ing
-                        job['purge'] = True
+            if (job['job_type'] == REVERT and
+                    len(job['sync_to']) == 1):
+                # TODO: instead of making ssync do the purge, just use
+                # the available list returned from ssync to clean up
+                # after sync on revert jobs.
+                job['purge'] = True
 
-                ssync_sender(self, node, job, suffixes)()
+            # ssync suffixes with remote node
+            self.suffix_count += len(suffixes)
+            ssync_sender(self, node, job, suffixes)()
 
+            try:
                 with Timeout(self.http_timeout):
                     conn = http_connect(
                         node['replication_ip'], node['replication_port'],
@@ -511,7 +564,6 @@ class ObjectReconstructor(Daemon):
                     _("Trying to sync suffixes with %s") % self._full_path(
                         node, job['partition'], '', job['policy']))
         self.partition_times.append(time.time() - begin)
-        self.logger.timing_since('partition.delete.timing', begin)
 
     def _get_job_info(self, local_dev, part_path, partition, policy):
         """

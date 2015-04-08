@@ -275,6 +275,8 @@ def hash_cleanup_listdir(hsh_path, reclaim_age=ONE_WEEK):
     files = listdir(hsh_path)
     if len(files) == 1:
         if files[0].endswith('.ts'):
+            # TODO: remove single .durable files, and single .data files
+            #       older than reclaim age.
             # remove tombstones older than reclaim_age
             ts = files[0].rsplit('.', 1)[0]
             if (time.time() - float(Timestamp(ts))) > reclaim_age:
