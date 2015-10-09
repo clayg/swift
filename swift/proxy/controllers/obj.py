@@ -2197,6 +2197,9 @@ class ECObjectController(BaseObjectController):
 
                     send_chunk(chunk)
 
+                self.app.logger.debug('sent final data chunk for %s' %
+                                      req.path)
+
                 if req.content_length and (
                         bytes_transferred < req.content_length):
                     req.client_disconnect = True
@@ -2224,6 +2227,9 @@ class ECObjectController(BaseObjectController):
                         putter.chunk_hasher.hexdigest()
                     putter.end_of_object_data(trail_md)
 
+                self.app.logger.debug('sent metadata docuemnt for %s' %
+                                      req.path)
+
                 for putter in putters:
                     putter.wait()
 
@@ -2238,6 +2244,7 @@ class ECObjectController(BaseObjectController):
                     self._get_put_responses(
                         req, putters, len(nodes), final_phase,
                         min_conns, need_quorum=need_quorum)
+                self.app.logger.debug('100-continue quorum for %s' % req.path)
                 if not quorum:
                     self.app.logger.error(
                         _('Not enough object servers ack\'ed (got %d)'),
@@ -2317,13 +2324,21 @@ class ECObjectController(BaseObjectController):
             statuses, min_responses, is_informational)
 
     def _await_response(self, conn, final_phase):
-        return conn.await_response(
+        self.app.logger.debug('awaiting response from %(ip)s/%(device)s',
+                              conn.node)
+        rv = conn.await_response(
             self.app.node_timeout, not final_phase)
+        self.app.logger.debug('got response from %(ip)s/%(device)s',
+                              conn.node)
+        return rv
 
-    def _get_conn_response_body(self, conn, req, final_phase, **kwargs):
+    def _get_conn_response_body(self, conn, req, final_phase,
+                                logger_thread_locals=None, **kwargs):
         """
         Await response from erasure coded object.
         """
+        if logger_thread_locals:
+            self.app.logger.thread_locals = logger_thread_locals
         try:
             resp = self._await_response(conn, final_phase=final_phase,
                                         **kwargs)
@@ -2338,7 +2353,11 @@ class ECObjectController(BaseObjectController):
                 _('Trying to get %s status of PUT to %s') % (
                     status_type, req.path))
         if resp and not is_informational(resp.status):
+            self.app.logger.debug('reading response from %(ip)s/%(device)s',
+                                  conn.node)
             body = resp.read()
+            self.app.logger.debug('finished read from %(ip)s/%(device)s',
+                                  conn.node)
         else:
             body = ''
         return (conn, resp, body)
@@ -2370,9 +2389,12 @@ class ECObjectController(BaseObjectController):
             if putter.failed:
                 continue
             pile.spawn(self._get_conn_response_body, putter, req,
-                       final_phase=final_phase)
+                       final_phase=final_phase,
+                       logger_thread_locals=self.app.logger.thread_locals)
 
         def _handle_response(putter, response, body):
+            self.app.logger.debug('handling response from %(ip)s/%(device)s',
+                                  putter.node)
             statuses.append(response.status)
             reasons.append(response.reason)
             bodies.append(body)
@@ -2395,15 +2417,20 @@ class ECObjectController(BaseObjectController):
             if response:
                 _handle_response(putter, response, body)
                 if self._have_adequate_successes(statuses, min_responses):
+                    self.app.logger.debug('have adequate for %s' % req.path)
                     break
             else:
                 putter.failed = True
+            self.app.logger.debug('handled response from %(ip)s/%(device)s',
+                                  putter.node)
 
         # give any pending requests *some* chance to finish
         finished_quickly = pile.waitall(self.app.post_quorum_timeout)
         for (putter, response, body) in finished_quickly:
             if response:
                 _handle_response(putter, response, body)
+            self.app.logger.debug('post quorum resp from %(ip)s/%(device)s',
+                                  putter.node)
 
         quorum = False
         if need_quorum:
@@ -2459,10 +2486,14 @@ class ECObjectController(BaseObjectController):
             min_conns = policy.quorum
             putters = [p for p in putters if not p.failed]
             # ignore response etags, and quorum boolean
+            self.app.logger.debug('getting all final responses for %s' %
+                                  req.path)
             statuses, reasons, bodies, _etags, _quorum = \
                 self._get_put_responses(req, putters, len(nodes),
                                         final_phase, min_conns,
                                         need_quorum=need_quorum)
+            self.app.logger.debug('all responses collected for %s' %
+                                  req.path)
         except HTTPException as resp:
             return resp
 
@@ -2472,4 +2503,5 @@ class ECObjectController(BaseObjectController):
                                   quorum_size=min_conns)
         resp.last_modified = math.ceil(
             float(Timestamp(req.headers['X-Timestamp'])))
+        self.app.logger.debug('returning response for %s' % req.path)
         return resp
