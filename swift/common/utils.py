@@ -1325,6 +1325,13 @@ class LogAdapter(logging.LoggerAdapter, object):
     def _exception(self, msg, *args, **kwargs):
         logging.LoggerAdapter.exception(self, msg, *args, **kwargs)
 
+    handled_socket_errors = {
+        errno.ECONNREFUSED,
+        errno.EHOSTUNREACH,
+        errno.ETIMEDOUT,
+        errno.EPIPE,
+    }
+
     def exception(self, msg, *args, **kwargs):
         _junk, exc, _junk = sys.exc_info()
         call = self.error
@@ -1335,12 +1342,8 @@ class LogAdapter(logging.LoggerAdapter, object):
             else:
                 call = self._exception
         elif isinstance(exc, socket.error):
-            if exc.errno == errno.ECONNREFUSED:
-                emsg = _('Connection refused')
-            elif exc.errno == errno.EHOSTUNREACH:
-                emsg = _('Host unreachable')
-            elif exc.errno == errno.ETIMEDOUT:
-                emsg = _('Connection timeout')
+            if exc.errno in self.handled_socket_errors:
+                emsg = _(os.strerror(exc.errno))
             else:
                 call = self._exception
         elif isinstance(exc, eventlet.Timeout):
