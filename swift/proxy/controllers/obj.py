@@ -326,6 +326,9 @@ class BaseObjectController(Controller):
                 return conn.getresponse()
 
     def _get_conn_response(self, conn, req, **kwargs):
+        """
+        Await response from replicated object.
+        """
         try:
             resp = self._await_response(conn, **kwargs)
             return (conn, resp)
@@ -2317,7 +2320,10 @@ class ECObjectController(BaseObjectController):
         return conn.await_response(
             self.app.node_timeout, not final_phase)
 
-    def _get_conn_response(self, conn, req, final_phase, **kwargs):
+    def _get_conn_response_body(self, conn, req, final_phase, **kwargs):
+        """
+        Await response from erasure coded object.
+        """
         try:
             resp = self._await_response(conn, final_phase=final_phase,
                                         **kwargs)
@@ -2331,7 +2337,11 @@ class ECObjectController(BaseObjectController):
                 conn.node, _('Object'),
                 _('Trying to get %s status of PUT to %s') % (
                     status_type, req.path))
-        return (conn, resp)
+        if resp and not is_informational(resp.status):
+            body = resp.read()
+        else:
+            body = ''
+        return (conn, resp, body)
 
     def _get_put_responses(self, req, putters, num_nodes, final_phase,
                            min_responses, need_quorum=True):
@@ -2359,16 +2369,12 @@ class ECObjectController(BaseObjectController):
         for putter in putters:
             if putter.failed:
                 continue
-            pile.spawn(self._get_conn_response, putter, req,
+            pile.spawn(self._get_conn_response_body, putter, req,
                        final_phase=final_phase)
 
-        def _handle_response(putter, response):
+        def _handle_response(putter, response, body):
             statuses.append(response.status)
             reasons.append(response.reason)
-            if final_phase:
-                body = response.read()
-            else:
-                body = ''
             bodies.append(body)
             if response.status == HTTP_INSUFFICIENT_STORAGE:
                 putter.failed = True
@@ -2385,10 +2391,9 @@ class ECObjectController(BaseObjectController):
             elif is_success(response.status):
                 etags.add(response.getheader('etag').strip('"'))
 
-        quorum = False
-        for (putter, response) in pile:
+        for (putter, response, body) in pile:
             if response:
-                _handle_response(putter, response)
+                _handle_response(putter, response, body)
                 if self._have_adequate_successes(statuses, min_responses):
                     break
             else:
@@ -2396,10 +2401,11 @@ class ECObjectController(BaseObjectController):
 
         # give any pending requests *some* chance to finish
         finished_quickly = pile.waitall(self.app.post_quorum_timeout)
-        for (putter, response) in finished_quickly:
+        for (putter, response, body) in finished_quickly:
             if response:
-                _handle_response(putter, response)
+                _handle_response(putter, response, body)
 
+        quorum = False
         if need_quorum:
             if final_phase:
                 while len(statuses) < num_nodes:
