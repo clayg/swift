@@ -793,6 +793,7 @@ class ObjectReconstructor(Daemon):
         override_devices = override_devices or []
         override_partitions = override_partitions or []
         ips = whataremyips(self.bind_ip)
+        self.device_count = 0
         for policy in POLICIES:
             if policy.policy_type != EC_POLICY:
                 continue
@@ -806,9 +807,9 @@ class ObjectReconstructor(Daemon):
                 policy.object_ring.devs))
 
             if override_devices:
-                self.device_count = len(override_devices)
+                self.device_count += len(override_devices)
             else:
-                self.device_count = len(local_devices)
+                self.device_count += len(local_devices)
 
             for local_dev in local_devices:
                 if override_devices and (local_dev['device'] not in
