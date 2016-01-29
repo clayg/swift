@@ -771,6 +771,9 @@ swift-ring-builder <builder_file> rebalance [options]
         parser.add_option('-s', '--seed', help="seed to use for rebalance")
         parser.add_option('-d', '--debug', action='store_true',
                           help="print debug information")
+        parser.add_option('--no-validate', action='store_true',
+                          help='Force a ring to save even if it does '
+                          'not validate, not safe')
         options, args = parser.parse_args(argv)
 
         def get_seed(index):
@@ -835,7 +838,10 @@ swift-ring-builder <builder_file> rebalance [options]
                   "Original exception message:\n %s" %
                   (e,))
             print('-' * 79)
-            exit(EXIT_ERROR)
+            if options.no_validate:
+                print("... saving ring anyway")
+            else:
+                exit(EXIT_ERROR)
         print('Reassigned %d (%.02f%%) partitions. '
               'Balance is now %.02f.  '
               'Dispersion is now %.02f' % (

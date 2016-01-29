@@ -967,37 +967,38 @@ class RingBuilder(object):
             # First, add up the count of replicas at each tier for each
             # partition.
             replicas_at_tier = defaultdict(int)
-            for dev in self._devs_for_part(part):
+            undispersed_dev_replicas = []
+            dev_replicas_for_part = self._dev_replicas_for_part(part)
+            for dev, replica in dev_replicas_for_part:
                 for tier in dev['tiers']:
                     replicas_at_tier[tier] += 1
-
-            # Now, look for partitions not yet spread out enough.
-            undispersed_dev_replicas = []
-            for replica in self._replicas_for_part(part):
-                dev_id = self._replica2part2dev[replica][part]
-                if dev_id == NONE_DEV:
-                    continue
-                dev = self.devs[dev_id]
                 # the min part hour check is ignored iff a device has more
                 # than one replica of a part assigned to it - which would have
                 # only been possible on rings built with older version of code
-                if (self._last_part_moves[part] < self.min_part_hours and
-                        not replicas_at_tier[dev['tiers'][-1]] > 1):
+                if replicas_at_tier[dev['tiers'][-1]] > 1:
+                    undispersed_dev_replicas.append((dev, replica))
+                    for tier in dev['tiers']:
+                        replicas_at_tier[tier] -= 1
+                    self._last_part_moves[part] = 0
+
+            # If multiple replicas of many parts are undispersed, pick up the
+            # replica that's on the most over-weight device first.
+            dev_replicas_for_part.sort(
+                key=lambda dr: dr[0]['parts_wanted'])
+            for dev, replica in dev_replicas_for_part:
+                if (self._last_part_moves[part] < self.min_part_hours):
                     break
                 if all(replicas_at_tier[tier] <=
                        replica_plan[tier]['max']
                        for tier in dev['tiers']):
                     continue
                 undispersed_dev_replicas.append((dev, replica))
+                self._last_part_moves[part] = 0
 
             if not undispersed_dev_replicas:
                 continue
 
-            undispersed_dev_replicas.sort(
-                key=lambda dr: dr[0]['parts_wanted'])
             for dev, replica in undispersed_dev_replicas:
-                if self._last_part_moves[part] < self.min_part_hours:
-                    break
                 dev['parts_wanted'] += 1
                 dev['parts'] -= 1
                 assign_parts[part].append(replica)
@@ -1005,9 +1006,6 @@ class RingBuilder(object):
                     "Gathered %d/%d from dev %d [dispersion]",
                     part, replica, dev['id'])
                 self._replica2part2dev[replica][part] = NONE_DEV
-                for tier in dev['tiers']:
-                    replicas_at_tier[tier] -= 1
-                self._last_part_moves[part] = 0
 
     def _gather_parts_for_balance_can_disperse(self, assign_parts, start,
                                                replica_plan):
@@ -1569,17 +1567,25 @@ class RingBuilder(object):
 
         Deliberately includes duplicates.
         """
+        return [dev for (dev, replica) in self._dev_replicas_for_part(part)]
+
+    def _dev_replicas_for_part(self, part):
+        """
+        Returns a list of (device, replica) tuples for a specified partition.
+
+        Deliberately includes duplicates.
+        """
         if self._replica2part2dev is None:
             return []
-        devs = []
-        for part2dev in self._replica2part2dev:
+        dev_replicas = []
+        for replica, part2dev in enumerate(self._replica2part2dev):
             if part >= len(part2dev):
                 continue
             dev_id = part2dev[part]
             if dev_id == NONE_DEV:
                 continue
-            devs.append(self.devs[dev_id])
-        return devs
+            dev_replicas.append((self.devs[dev_id], replica))
+        return dev_replicas
 
     def _replicas_for_part(self, part):
         """
