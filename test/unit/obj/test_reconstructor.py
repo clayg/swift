@@ -625,7 +625,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             stat_line = line.split('of', 1)[0].strip()
             stats_lines.add(stat_line)
         acceptable = set([
-            '0/3 (0.00%) partitions',
+            '1/8 (12.50%) partitions',
             '8/8 (100.00%) partitions',
         ])
         matched = stats_lines & acceptable
@@ -718,7 +718,6 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
         rmtree(testring, ignore_errors=1)
 
     def test_build_reconstruction_jobs(self):
-        self.reconstructor.handoffs_first = False
         self.reconstructor._reset_stats()
         for part_info in self.reconstructor.collect_parts():
             jobs = self.reconstructor.build_reconstruction_jobs(part_info)
@@ -727,13 +726,40 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
                              object_reconstructor.REVERT))
             self.assert_expected_jobs(part_info['partition'], jobs)
 
+    def test_handoffs_first(self):
         self.reconstructor.handoffs_first = True
-        self.reconstructor._reset_stats()
-        for part_info in self.reconstructor.collect_parts():
-            jobs = self.reconstructor.build_reconstruction_jobs(part_info)
-            self.assertTrue(jobs[0]['job_type'] ==
-                            object_reconstructor.REVERT)
-            self.assert_expected_jobs(part_info['partition'], jobs)
+
+        found_job_types = set()
+
+        def fake_process_job(job):
+            # increment failure counter
+            self.reconstructor.handoffs_remaining += 1
+            found_job_types.add(job['job_type'])
+
+        self.reconstructor.process_job = fake_process_job
+
+        # only revert jobs
+        self.reconstructor.reconstruct()
+        self.assertEqual(found_job_types, {object_reconstructor.REVERT})
+        # but failures keep handoffs remaining
+        msgs = self.reconstructor.logger.get_lines_for_level('info')
+        self.assertIn('Next pass will only revert handoffs', msgs[-1])
+        self.logger._clear()
+
+        found_job_types = set()
+
+        def fake_process_job(job):
+            # increment failure counter
+            found_job_types.add(job['job_type'])
+
+        self.reconstructor.process_job = fake_process_job
+
+        # only revert jobs ... but all handoffs cleared out successfully
+        self.reconstructor.reconstruct()
+        self.assertEqual(found_job_types, {object_reconstructor.REVERT})
+        # it's time to turn off handoffs_first
+        msgs = self.reconstructor.logger.get_lines_for_level('warning')
+        self.assertIn('You should disable handoffs first', msgs[-1])
 
     def test_get_partners(self):
         # we're going to perform an exhaustive test of every possible
@@ -804,16 +830,14 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             pass
         self.assertTrue(os.path.isfile(pol_1_part_1_path))  # sanity check
 
-        # since our collect_parts job is a generator, that yields directly
-        # into build_jobs and then spawns it's safe to do the remove_files
-        # without making reconstructor startup slow
-        self.reconstructor._reset_stats()
-        for part_info in self.reconstructor.collect_parts():
-            self.assertNotEqual(pol_1_part_1_path, part_info['part_path'])
+        self.reconstructor.process_job = lambda j: None
+        self.reconstructor.reconstruct()
+
         self.assertFalse(os.path.exists(pol_1_part_1_path))
         warnings = self.reconstructor.logger.get_lines_for_level('warning')
         self.assertEqual(1, len(warnings))
-        self.assertIn('Unexpected entity in data dir:', warnings[0])
+        self.assertIn(pol_1_part_1_path, warnings[0])
+        self.assertIn('not a directory', warnings[0].lower())
 
     def test_ignores_status_file(self):
         # Following fd86d5a, the auditor will leave status files on each device
@@ -2287,14 +2311,13 @@ class TestObjectReconstructor(unittest.TestCase):
         self.assertEqual(call['node'], sync_to[0])
         self.assertEqual(set(call['suffixes']), set(['123', 'abc']))
 
-    def test_process_job_revert_to_handoff(self):
+    def test_process_job_will_not_revert_to_handoff(self):
         replicas = self.policy.object_ring.replicas
         frag_index = random.randint(0, replicas - 1)
         sync_to = [random.choice([n for n in self.policy.object_ring.devs
                                   if n != self.local_dev])]
         sync_to[0]['index'] = frag_index
         partition = 0
-        handoff = next(self.policy.object_ring.get_more_nodes(partition))
 
         stub_hashes = {
             '123': {frag_index: 'hash', None: 'hash'},
@@ -2326,7 +2349,7 @@ class TestObjectReconstructor(unittest.TestCase):
 
         expected_suffix_calls = set([
             (node['replication_ip'], '/%s/0/123-abc' % node['device'])
-            for node in (sync_to[0], handoff)
+            for node in (sync_to[0],)
         ])
 
         ssync_calls = []
@@ -2383,9 +2406,6 @@ class TestObjectReconstructor(unittest.TestCase):
         expected_suffix_calls = set([
             (sync_to[0]['replication_ip'],
              '/%s/0/123-abc' % sync_to[0]['device'])
-        ] + [
-            (node['replication_ip'], '/%s/0/123-abc' % node['device'])
-            for node in handoff_nodes[:-1]
         ])
 
         ssync_calls = []
@@ -2401,9 +2421,8 @@ class TestObjectReconstructor(unittest.TestCase):
                                  for r in request_log.requests)
         self.assertEqual(expected_suffix_calls, found_suffix_calls)
 
-        # this is ssync call to primary (which fails) plus the ssync call to
-        # all of the handoffs (except the last one - which is the local_dev)
-        self.assertEqual(len(ssync_calls), len(handoff_nodes))
+        # this is ssync call to primary (which fails) and nothing else!
+        self.assertEqual(len(ssync_calls), 1)
         call = ssync_calls[0]
         self.assertEqual(call['node'], sync_to[0])
         self.assertEqual(set(call['suffixes']), set(['123', 'abc']))

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import errno
 import os
 from os.path import join
 import random
@@ -558,7 +559,6 @@ class ObjectReconstructor(Daemon):
                 self.logger.exception(
                     'Unable to purge DiskFile (%r %r %r)',
                     object_hash, timestamps['ts_data'], frag_index)
-                continue
 
     def process_job(self, job):
         """
@@ -644,16 +644,9 @@ class ObjectReconstructor(Daemon):
         """
         self.logger.increment(
             'partition.delete.count.%s' % (job['local_dev']['device'],))
-        # we'd desperately like to push this partition back to it's
-        # primary location, but if that node is down, the next best thing
-        # is one of the handoff locations - which *might* be us already!
-        dest_nodes = itertools.chain(
-            job['sync_to'],
-            job['policy'].object_ring.get_more_nodes(job['partition']),
-        )
         syncd_with = 0
         reverted_objs = {}
-        for node in dest_nodes:
+        for node in job['sync_to']:
             if syncd_with >= len(job['sync_to']):
                 break
             if node['id'] == job['local_dev']['id']:
@@ -668,6 +661,8 @@ class ObjectReconstructor(Daemon):
         if syncd_with >= len(job['sync_to']):
             self.delete_reverted_objs(
                 job, reverted_objs, job['frag_index'])
+        else:
+            self.handoffs_remaining += 1
         self.logger.timing_since('partition.delete.timing', begin)
 
     def _get_part_jobs(self, local_dev, part_path, partition, policy):
@@ -698,7 +693,14 @@ class ObjectReconstructor(Daemon):
         :returns: a list of dicts of job info
         """
         # find all the fi's in the part, and which suffixes have them
-        hashes = self._get_hashes(policy, part_path, do_listdir=True)
+        try:
+            hashes = self._get_hashes(policy, part_path, do_listdir=True)
+        except OSError as e:
+            if e.errno != errno.ENOTDIR:
+                raise
+            self.logger.warning(
+                'Unexpected entity %r is not a directory' % part_path)
+            return []
         non_data_fragment_suffixes = []
         data_fi_to_suffixes = defaultdict(list)
         for suffix, fi_hash in hashes.items():
@@ -800,6 +802,7 @@ class ObjectReconstructor(Daemon):
         override_devices = override_devices or []
         override_partitions = override_partitions or []
         ips = whataremyips(self.bind_ip)
+        all_parts = []
         for policy in POLICIES:
             if policy.policy_type != EC_POLICY:
                 continue
@@ -852,8 +855,7 @@ class ObjectReconstructor(Daemon):
                     if partition in ('auditor_status_ALL.json',
                                      'auditor_status_ZBF.json'):
                         continue
-                    if not (partition.isdigit() and
-                            os.path.isdir(part_path)):
+                    if not partition.isdigit():
                         self.logger.warning(
                             'Unexpected entity in data dir: %r' % part_path)
                         remove_file(part_path)
@@ -869,8 +871,9 @@ class ObjectReconstructor(Daemon):
                         'partition': partition,
                         'part_path': part_path,
                     }
-                    yield part_info
-                    self.reconstruction_part_count += 1
+                    all_parts.append(part_info)
+            random.shuffle(all_parts)
+            return all_parts
 
     def build_reconstruction_jobs(self, part_info):
         """
@@ -879,9 +882,6 @@ class ObjectReconstructor(Daemon):
         """
         jobs = self._get_part_jobs(**part_info)
         random.shuffle(jobs)
-        if self.handoffs_first:
-            # Move the handoff revert jobs to the front of the list
-            jobs.sort(key=lambda job: job['job_type'], reverse=True)
         self.job_count += len(jobs)
         return jobs
 
@@ -897,10 +897,12 @@ class ObjectReconstructor(Daemon):
         self.reconstruction_part_count = 0
         self.reconstruction_device_count = 0
         self.last_reconstruction_count = -1
+        self.handoffs_remaining = 0
 
     def delete_partition(self, path):
         self.logger.info(_("Removing partition: %s"), path)
         tpool.execute(shutil.rmtree, path, ignore_errors=True)
+        remove_file(path)
 
     def reconstruct(self, **kwargs):
         """Run a reconstruction pass"""
@@ -909,15 +911,16 @@ class ObjectReconstructor(Daemon):
 
         stats = spawn(self.heartbeat)
         lockup_detector = spawn(self.detect_lockups)
-        sleep()  # Give spawns a cycle
 
         try:
             self.run_pool = GreenPool(size=self.concurrency)
             for part_info in self.collect_parts(**kwargs):
+                sleep()  # Give spawns a cycle
                 if not self.check_ring(part_info['policy'].object_ring):
                     self.logger.info(_("Ring change detected. Aborting "
                                        "current reconstruction pass."))
                     return
+                self.reconstruction_part_count += 1
                 jobs = self.build_reconstruction_jobs(part_info)
                 if not jobs:
                     # If this part belongs on this node, _get_part_jobs
@@ -930,6 +933,10 @@ class ObjectReconstructor(Daemon):
                     self.run_pool.spawn(self.delete_partition,
                                         part_info['part_path'])
                 for job in jobs:
+                    if (self.handoffs_first and job['job_type'] != REVERT):
+                        self.logger.debug('Skipping %s job for %s',
+                                          job['job_type'], job['path'])
+                        continue
                     self.run_pool.spawn(self.process_job, job)
             with Timeout(self.lockup_timeout):
                 self.run_pool.waitall()
@@ -941,6 +948,15 @@ class ObjectReconstructor(Daemon):
             stats.kill()
             lockup_detector.kill()
             self.stats_line()
+        if self.handoffs_first:
+            if self.handoffs_remaining > 0:
+                self.logger.info(_(
+                    "Handoffs first mode still has handoffs remaining.  "
+                    "Next pass will only revert handoffs."))
+            else:
+                self.logger.warning(_(
+                    "Handoffs first mode found no handoffs remaining.  "
+                    "You should disable handoffs first immediately."))
 
     def run_once(self, *args, **kwargs):
         start = time.time()
