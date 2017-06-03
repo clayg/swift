@@ -155,6 +155,7 @@ class ObjectReconstructor(Daemon):
         self.port = None if self.servers_per_port else \
             int(conf.get('bind_port', 6200))
         self.concurrency = int(conf.get('concurrency', 1))
+        self.disks_per_worker = int(conf.get('disks_per_worker', 0))
         self.stats_interval = int(conf.get('stats_interval', '300'))
         self.ring_check_interval = int(conf.get('ring_check_interval', 15))
         self.next_check = time.time() + self.ring_check_interval
@@ -1040,6 +1041,7 @@ class ObjectReconstructor(Daemon):
             with Timeout(self.lockup_timeout):
                 self.run_pool.waitall()
         except (Exception, Timeout):
+            # TODO: this renders incorrectly
             self.logger.exception(_("Exception in top-level"
                                     "reconstruction loop"))
             self.kill_coros()
@@ -1081,14 +1083,24 @@ class ObjectReconstructor(Daemon):
         while True:
             start = time.time()
             self.logger.info(_("Starting object reconstruction pass."))
+            override_devices = list_from_csv(kwargs.get('devices'))
+            override_partitions = [int(p) for p in
+                                   list_from_csv(kwargs.get('partitions'))]
             # Run the reconstructor
-            self.reconstruct()
+            self.reconstruct(
+                override_devices=override_devices,
+                override_partitions=override_partitions)
             total = (time.time() - start) / 60
             self.logger.info(
                 _("Object reconstruction complete. (%.02f minutes)"), total)
-            dump_recon_cache({'object_reconstruction_time': total,
-                              'object_reconstruction_last': time.time()},
-                             self.rcache, self.logger)
+            recon_update = {
+                'object_reconstruction_time': total,
+                'object_reconstruction_last': time.time(),
+            }
+            if override_devices:
+                recon_update = {'object_reconstruction_per_disk': {
+                    d: recon_update for d in override_devices}}
+            dump_recon_cache(recon_update, self.rcache, self.logger)
             self.logger.debug('reconstruction sleeping for %s seconds.',
                               self.interval)
             sleep(self.interval)

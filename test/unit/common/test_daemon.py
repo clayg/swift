@@ -89,7 +89,7 @@ class TestRunDaemon(unittest.TestCase):
         d = MyDaemon({})
         with mock.patch('swift.common.daemon.signal') as mock_signal:
             mock_signal.SIGTERM = signal.SIGTERM
-            d.run()
+            daemon.DaemonStrategy(d, d.logger).run()
         signal_args, kwargs = mock_signal.signal.call_args
         sig, func = signal_args
         self.assertEqual(sig, signal.SIGTERM)
