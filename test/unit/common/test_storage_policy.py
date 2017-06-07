@@ -28,7 +28,8 @@ from swift.common.storage_policy import (
     StoragePolicyCollection, POLICIES, PolicyError, parse_storage_policies,
     reload_storage_policies, get_policy_string, split_policy_string,
     BaseStoragePolicy, StoragePolicy, ECStoragePolicy, REPL_POLICY, EC_POLICY,
-    VALID_EC_TYPES, DEFAULT_EC_OBJECT_SEGMENT_SIZE, BindPortsCache)
+    VALID_EC_TYPES, DEFAULT_EC_OBJECT_SEGMENT_SIZE, BindPortsCache,
+    RingMetadataCache)
 from swift.common.ring import RingData
 from swift.common.exceptions import RingLoadError
 from pyeclib.ec_iface import ECDriver
@@ -1124,50 +1125,52 @@ class TestStoragePolicies(unittest.TestCase):
         devs_by_ring_name1 = {
             'object': [  # 'aay'
                 {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[0],
-                 'port': 6006},
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[0],
-                 'port': 6007},
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
-                 'port': 6008},
+                 'port': 6006, 'device': 'd0'},
+                {'id': 1, 'zone': 0, 'region': 1, 'ip': other_ips[0],
+                 'port': 6007, 'device': 'd1'},
+                {'id': 2, 'zone': 0, 'region': 1, 'ip': my_ips[1],
+                 'port': 6008, 'device': 'd2'},
                 None,
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
-                 'port': 6009}],
+                {'id': 4, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6009, 'device': 'd4'}],
             'object-1': [  # 'bee'
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
-                 'port': 6006},  # dupe
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[0],
-                 'port': 6010},
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
-                 'port': 6011},
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
-                 'port': 6012}],
+                {'id': 1, 'zone': 0, 'region': 1, 'ip': my_ips[1],
+                 'port': 6006, 'device': 'd1'},  # dupe
+                {'id': 2, 'zone': 0, 'region': 1, 'ip': other_ips[0],
+                 'port': 6010, 'device': 'd2'},
+                {'id': 3, 'zone': 0, 'region': 1, 'ip': my_ips[1],
+                 'port': 6011, 'device': 'd3'},
+                {'id': 4, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6012, 'device': 'd4'}],
             'object-2': [  # 'cee'
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[0],
-                 'port': 6010},  # on our IP and a not-us IP
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[0],
-                 'port': 6013},
+                {'id': 1, 'zone': 0, 'region': 1, 'ip': my_ips[0],
+                 'port': 6010, 'device': 'd1'},  # on our IP and a not-us IP
+                {'id': 2, 'zone': 0, 'region': 1, 'ip': other_ips[0],
+                 'port': 6013, 'device': 'd2'},
                 None,
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
-                 'port': 6014},
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
-                 'port': 6015}],
+                {'id': 4, 'zone': 0, 'region': 1, 'ip': my_ips[1],
+                 'port': 6014, 'device': 'd4'},
+                {'id': 5, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6015, 'device': 'd5'}],
         }
         devs_by_ring_name2 = {
             'object': [  # 'aay'
                 {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[0],
-                 'port': 6016},
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
-                 'port': 6019}],
+                 'port': 6016, 'device': 'd0'},
+                {'id': 1, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6019, 'device': 'd1'}],
             'object-1': [  # 'bee'
                 {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[1],
-                 'port': 6016},  # dupe
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
-                 'port': 6022}],
+                 'port': 6016, 'device': 'd0'},  # dupe
+                {'id': 1, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6022, 'device': 'd1'}],
             'object-2': [  # 'cee'
                 {'id': 0, 'zone': 0, 'region': 1, 'ip': my_ips[0],
-                 'port': 6020},
-                {'id': 0, 'zone': 0, 'region': 1, 'ip': other_ips[1],
-                 'port': 6025}],
+                 'port': 6020, 'device': 'd0'},
+                None,
+                None,
+                {'id': 4, 'zone': 0, 'region': 1, 'ip': other_ips[1],
+                 'port': 6025, 'device': 'd4'}],
         }
         ring_files = [ring_name + '.ring.gz'
                       for ring_name in sorted(devs_by_ring_name1)]
@@ -1179,16 +1182,23 @@ class TestStoragePolicies(unittest.TestCase):
                 part_shift=24)
 
         with mock.patch(
-                'swift.common.storage_policy.RingData.load'
+                'swift.common.ring.ring.RingData.load'
         ) as mock_ld, \
                 patch_policies(test_policies), \
-                mock.patch('swift.common.storage_policy.whataremyips') \
+                mock.patch('swift.common.ring.ring.whataremyips') \
                 as mock_whataremyips, \
                 temptree(ring_files) as tempdir:
             mock_whataremyips.return_value = my_ips
 
             cache = BindPortsCache(tempdir, bind_ip)
+            self.assertEqual([
+                mock.call(bind_ip),
+            ], mock_whataremyips.mock_calls)
+            mock_whataremyips.reset_mock()
 
+            dcache = RingMetadataCache.from_policies(
+                POLICIES, 'device',
+                swift_dir=tempdir, bind_ip=bind_ip, bind_port=None)
             self.assertEqual([
                 mock.call(bind_ip),
             ], mock_whataremyips.mock_calls)
@@ -1207,6 +1217,9 @@ class TestStoragePolicies(unittest.TestCase):
                 mock.call(os.path.join(tempdir, ring_files[2]),
                           metadata_only=True),
             ], mock_ld.mock_calls)
+            self.assertEqual(
+                {'d4', 'd2', 'd3', 'd0', 'd1'},
+                dcache.unique_values_for_devs_from_rings())
             mock_ld.reset_mock()
 
             mock_ld.side_effect = partial(_fake_load,
@@ -1214,6 +1227,9 @@ class TestStoragePolicies(unittest.TestCase):
             self.assertEqual(set([
                 6006, 6008, 6011, 6010, 6014,
             ]), cache.all_bind_ports_for_node())
+            self.assertEqual(
+                {'d4', 'd2', 'd3', 'd0', 'd1'},
+                dcache.unique_values_for_devs_from_rings())
             self.assertEqual([], mock_ld.mock_calls)
 
             # but when all the file mtimes are made different, it'll
@@ -1233,6 +1249,9 @@ class TestStoragePolicies(unittest.TestCase):
                 mock.call(os.path.join(tempdir, ring_files[2]),
                           metadata_only=True),
             ], mock_ld.mock_calls)
+            self.assertEqual(
+                {'d0'},
+                dcache.unique_values_for_devs_from_rings())
             mock_ld.reset_mock()
 
             # Don't do something stupid like crash if a ring file is missing.

@@ -14,11 +14,12 @@
 # limitations under the License.
 
 
-from swift.common.ring.ring import RingData, Ring
+from swift.common.ring.ring import RingData, RingMetadataCache, Ring
 from swift.common.ring.builder import RingBuilder
 
 __all__ = [
     'RingData',
+    'RingMetadataCache',
     'Ring',
     'RingBuilder',
 ]

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import array
+import six
 import six.moves.cPickle as pickle
 import json
 from collections import defaultdict
@@ -31,8 +32,8 @@ import sys
 from six.moves import range
 
 from swift.common.exceptions import RingLoadError
-from swift.common.utils import hash_path, validate_configuration
-from swift.common.ring.utils import tiers_for_dev
+from swift.common.utils import hash_path, validate_configuration, whataremyips
+from swift.common.ring.utils import tiers_for_dev, is_local_device
 
 
 class RingData(object):
@@ -156,6 +157,104 @@ class RingData(object):
         return {'devs': self.devs,
                 'replica2part2dev_id': self._replica2part2dev_id,
                 'part_shift': self._part_shift}
+
+
+class RingMetadataCache(object):
+
+    def __init__(self, ring_paths, device_info_key, bind_ip, bind_port,
+                 replication=False):
+        """
+        Given a locaiton to load rings, the unique ip address to identify a
+        backend storage server, and a specific device key, use a caching
+        strategy to determine the set of all devices defined in all rings for
+        this storage server and extract the unique set of the specific
+        metatadata values from those devices.
+
+        :param ring_paths: a list of strings, the paths on disk from which to
+                           load RingData
+        :param device_info_key: the key from which to extract unique values
+                                from each device dict in each ring's list of
+                                devices.
+        :param bind_ip: The configured bind_ip for the server that matches its
+                        devices in the rings, None matches all ports
+        :param bind_port: The configured bind_port for the server that matches
+                          its devices in the rings
+        :param replication: bool, use replication ip/port for is_local_device
+        """
+        self.ring_paths = ring_paths
+        self.device_info_key = device_info_key
+        self.my_ips = set(whataremyips(bind_ip))
+        self.bind_port = bind_port
+        self.replication = replication
+
+        self.mtimes_by_ring_path = {}
+        self.cache_by_ring_path = {}
+
+    def is_local_device(self, dev):
+        if self.replication:
+            dev_ip, dev_port = dev['replication_ip'], dev['replication_port']
+        else:
+            dev_ip, dev_port = dev['ip'], dev['port']
+        return is_local_device(self.my_ips, self.bind_port, dev_ip, dev_port)
+
+    def unique_values_for_devs_from_rings(self):
+        """
+        For all of this nodes devices in all rings return the set of unique
+        values for the given key.
+
+        N.B. The caller is responsible for not calling methods (which performs
+        at least a stat on all ring files) too frequently.
+        """
+        # NOTE: we don't worry about disappearing rings here because you can't
+        # ever delete a storage policy.
+        for serialized_path in self.ring_paths:
+            try:
+                new_mtime = os.path.getmtime(serialized_path)
+            except OSError:
+                continue
+            old_mtime = self.mtimes_by_ring_path.get(serialized_path)
+            if not old_mtime or old_mtime != new_mtime:
+                # N.B. we must use metadata_only to load the ring.  Users of
+                # this utility function do not want the actual ring data, just
+                # the device metadata.
+                self.cache_by_ring_path[serialized_path] = set(
+                    dev[self.device_info_key]
+                    for dev in RingData.load(serialized_path,
+                                             metadata_only=True).devs
+                    if dev and self.is_local_device(dev))
+                self.mtimes_by_ring_path[serialized_path] = new_mtime
+                # No "break" here so that the above line will update the
+                # mtimes_by_ring_path entry for any ring that changes, not just
+                # the first one we notice.
+
+        # Return the requested set of ports from our (now-freshened) cache
+        return six.moves.reduce(set.union,
+                                self.cache_by_ring_path.values(), set())
+
+    @classmethod
+    def from_policies(cls, policies, device_info_key,
+                      swift_dir, bind_ip, bind_port, **conf):
+        """
+        Helper to get a RingMetadataCache up and running from a list of
+        policies and a config dictionary.
+
+        :param policies: an iterable of StoragePolicy instances
+        :param device_info_key: the key from which to extract unique values
+                                from each device dict in each ring's list of
+                                devices.
+        :param swift_dir: The location from which to load rings, typicaly
+                          /etc/swift/
+        :param bind_ip: The configured bind_ip for the server that matches its
+                        devices in the rings
+        :param bind_port: The configured bind_port for the server that matches
+                          its devices in the rings
+
+        """
+        # This is *almost* duplicated with Ring.__init__...
+        ring_paths = [
+            os.path.join(swift_dir, policy.ring_name + '.ring.gz')
+            for policy in policies]
+        return cls(ring_paths, device_info_key, bind_ip, bind_port)
 
 
 class Ring(object):

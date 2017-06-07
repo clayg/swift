@@ -13,16 +13,14 @@
 
 
 import logging
-import os
 import string
 import sys
 import textwrap
-import six
 from six.moves.configparser import ConfigParser
 from swift.common.utils import (
-    config_true_value, SWIFT_CONF_FILE, whataremyips, list_from_csv,
+    config_true_value, SWIFT_CONF_FILE, list_from_csv,
     config_positive_int_value)
-from swift.common.ring import Ring, RingData
+from swift.common.ring import Ring, RingMetadataCache
 from swift.common.utils import quorum_size
 from swift.common.exceptions import RingLoadError
 from pyeclib.ec_iface import ECDriver, ECDriverError, VALID_EC_TYPES
@@ -37,51 +35,21 @@ DEFAULT_EC_OBJECT_SEGMENT_SIZE = 1048576
 
 
 class BindPortsCache(object):
+
+    DEVICE_KEY = 'port'
+
     def __init__(self, swift_dir, bind_ip):
-        self.swift_dir = swift_dir
-        self.mtimes_by_ring_path = {}
-        self.portsets_by_ring_path = {}
-        self.my_ips = set(whataremyips(bind_ip))
+        """
+        Legacy shim for RingMetadataCache and it's original use-case.
+
+        N.B. This interface may be removed in a future version.  Consumers
+        should use RingMetadataCache directly instead.
+        """
+        self._cache = RingMetadataCache.from_policies(
+            POLICIES, 'port', swift_dir, bind_ip, bind_port=None)
 
     def all_bind_ports_for_node(self):
-        """
-        Given an iterable of IP addresses identifying a storage backend server,
-        return a set of all bind ports defined in all rings for this storage
-        backend server.
-
-        The caller is responsible for not calling this method (which performs
-        at least a stat on all ring files) too frequently.
-        """
-        # NOTE: we don't worry about disappearing rings here because you can't
-        # ever delete a storage policy.
-
-        for policy in POLICIES:
-            # NOTE: we must NOT use policy.load_ring to load the ring.  Users
-            # of this utility function will not need the actual ring data, just
-            # the bind ports.
-            #
-            # This is duplicated with Ring.__init__ just a bit...
-            serialized_path = os.path.join(self.swift_dir,
-                                           policy.ring_name + '.ring.gz')
-            try:
-                new_mtime = os.path.getmtime(serialized_path)
-            except OSError:
-                continue
-            old_mtime = self.mtimes_by_ring_path.get(serialized_path)
-            if not old_mtime or old_mtime != new_mtime:
-                self.portsets_by_ring_path[serialized_path] = set(
-                    dev['port']
-                    for dev in RingData.load(serialized_path,
-                                             metadata_only=True).devs
-                    if dev and dev['ip'] in self.my_ips)
-                self.mtimes_by_ring_path[serialized_path] = new_mtime
-                # No "break" here so that the above line will update the
-                # mtimes_by_ring_path entry for any ring that changes, not just
-                # the first one we notice.
-
-        # Return the requested set of ports from our (now-freshened) cache
-        return six.moves.reduce(set.union,
-                                self.portsets_by_ring_path.values(), set())
+        return self._cache.unique_values_for_devs_from_rings()
 
 
 class PolicyError(ValueError):
